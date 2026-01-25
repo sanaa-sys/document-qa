@@ -1,4 +1,3 @@
-torch
 langchain-groq
 langchain-huggingface 
 langchain-qdrant 
@@ -6,4 +5,4 @@ langchain-community
 pypdf 
 qdrant-client
 streamlit
-sentence-tranformers
+sentence-transformers
