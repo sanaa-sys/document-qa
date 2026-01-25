@@ -1,2 +1,8 @@
+langchain-groq
+langchain-huggingface 
+langchain-qdrant 
+langchain-community 
+pypdf 
+qdrant-client
 streamlit
-openai
+sentence_tranformers
