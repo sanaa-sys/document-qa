@@ -1,3 +1,4 @@
+torch
 langchain-groq
 langchain-huggingface 
 langchain-qdrant 
