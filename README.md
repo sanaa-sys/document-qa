@@ -1,6 +1,8 @@
 # 📄 Document question answering template
 
 A simple Streamlit app that answers questions related to prophetic medicine. This is the structure of the code:
+
+
 ┌─────────────┐    ┌──────────────────┐    ┌─────────────┐    ┌──────────────┐
 │   PDF File  │───▶│  Text Chunking   │───▶│  HF API     │───▶│   Qdrant     │
 │             │    │  (PyMuPDF)       │    │ (Embeddings)│    │ (Vector DB)  │
