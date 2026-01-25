@@ -5,4 +5,4 @@ langchain-community
 pypdf 
 qdrant-client
 streamlit
-sentence_tranformers
+sentence-tranformers
