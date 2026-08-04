@@ -1,8 +1,5 @@
-langchain-groq
-langchain-huggingface 
-langchain-qdrant 
-langchain-community 
-pypdf 
-qdrant-client
-streamlit
-sentence-transformers
+streamlit==1.39.0
+streamlit-option-menu==0.3.12
+sentence-transformers==3.3.1
+faiss-cpu==1.9.0
+requests==2.32.3
