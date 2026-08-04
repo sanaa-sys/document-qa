@@ -10,6 +10,8 @@ from datetime import datetime
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
+GROQ_MODEL = "llama3-8b-8192"  # Free tier, good quality, generous context
+TEMPERATURE = 0.1  # Low temperature for consistent medical answers
 @st.cache_resource
 def load_rag_components():
     """Load index + model ONCE (cached for entire app lifetime)"""
@@ -50,16 +52,15 @@ def retrieve_relevant_chunks(question, index, chunks, model, top_k=5):
             })
     return results
 
-
-def generate_answer(question, retrieved_chunks):
-    """Call your LLM API to generate a grounded answer"""
-    api_key = st.secrets["GROQ_API_KEY"]
-
+def generate_answer_groq(question, retrieved_chunks):
+    """Call Groq API to generate a grounded answer"""
+    api_key = st.secrets.get["GROQ_API_KEY"]
+    
     if not api_key:
         # Fallback: return raw chunks if no API key configured
         context = "\n\n".join([c["text"] for c in retrieved_chunks])
         return (
-            f"I found {len(retrieved_chunks)} relevant passages, but no LLM API key "
+            f"I found {len(retrieved_chunks)} relevant passages, but no Groq API key "
             f"is configured. Here's the most relevant context:\n\n{context}"
         )
 
@@ -67,32 +68,53 @@ def generate_answer(question, retrieved_chunks):
         f"[Page {c['page']}] {c['text']}" for c in retrieved_chunks
     ])
 
-    prompt = f"""You are a medical knowledge assistant. Answer the question based 
-ONLY on the context below. If the context doesn't contain the answer, say 
-"I don't have sufficient information to answer that."
+    # Build system prompt for medical grounding
+    prompt = f"""You are a medical knowledge assistant. Your job is to answer 
+questions based ONLY on the provided medical reference document context below.
 
-Context:
+IMPORTANT RULES:
+1. Answer using ONLY information from the context
+2. If the context doesn't contain the answer, say "I don't have sufficient information to answer that based on the available medical documents."
+3. Be precise and factual — do not speculate or add external knowledge
+4. Keep answers clear and concise for healthcare professionals
+
+Context from Medical Reference Document:
 {context}
 
 Question: {question}
-"""
+
+Answer:"""
 
     try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 500
-            },
-            timeout=30
+        from groq import Groq
+        
+        client = Groq(api_key=api_key)
+        
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful medical knowledge assistant. Answer questions accurately based ONLY on the provided context from medical reference documents. If the information isn't in the context, politely state that you cannot answer."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            temperature=TEMPERATURE,
+            max_tokens=500,
+            top_p=1,
+            stream=False
         )
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
+        
+        answer = response.choices[0].message.content
+        return answer
+        
+    except ImportError:
+        return "Error: Groq SDK not installed. Add 'groq' to requirements.txt."
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        return f"Error generating answer with Groq: {str(e)}"
 
 
 # ──────────────────────────────────────────────
