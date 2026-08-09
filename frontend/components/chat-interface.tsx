@@ -16,9 +16,9 @@ type Message = {
 }
 
 const suggestions = [
-    'What are common symptoms of dehydration?',
-    'How does ibuprofen work?',
-    'When should I worry about a fever?',
+    'What are the benefits of date?',
+    'How to treat PCOS?',
+    'How to improve hyfration?',
 ]
 
 function sourceLabel(s: Source): string {
