@@ -16,7 +16,8 @@ app = FastAPI(title="MedChat API")
 # ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Add production URL later
+    allow_origins=["http://localhost:3000",       "https://document-qa-six.vercel.app",
+        "https://document-qa-six.vercel.app/*","*"],  # Add production URL later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
