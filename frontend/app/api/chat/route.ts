@@ -5,7 +5,7 @@ import { type NextRequest, NextResponse } from 'next/server'
  * accidental quotes/whitespace from the Vercel dashboard.
  */
 function getBackendBaseUrl(): string | null {
-  const raw = process.env.FASTAPI_URL
+    const raw = process.env.FASTAPI_URL || ' '
 
   const cleaned = raw.trim().replace(/^['"]|['"]$/g, '').replace(/\/$/, '')
   return cleaned || null

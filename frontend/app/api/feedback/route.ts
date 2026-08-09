@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from 'next/server'
 
 function getBackendBaseUrl(): string | null {
   const raw =
-    process.env.FASTAPI_URL 
+    process.env.FASTAPI_URL || ' '
   const cleaned = raw.trim().replace(/^['"]|['"]$/g, '').replace(/\/$/, '')
   return cleaned || null
 }
@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     comments: body.comments.trim(),
   }
 
-    const FASTAPI_URL = process.env.FASTAPI_URL
+    const FASTAPI_URL = getBackendBaseUrl()
 
   // If a backend is configured, forward the feedback to FastAPI (main.py).
   // Otherwise just log it so the form still works during development.
