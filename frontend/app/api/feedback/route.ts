@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     comments: body.comments.trim(),
   }
 
-  const FASTAPI_URL = getBackendBaseUrl()
+    const FASTAPI_URL = process.env.FASTAPI_URL
 
   // If a backend is configured, forward the feedback to FastAPI (main.py).
   // Otherwise just log it so the form still works during development.
