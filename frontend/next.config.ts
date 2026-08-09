@@ -6,7 +6,7 @@ const nextConfig: NextConfig = {
         unoptimized: true,
     },
     async rewrites() {
-        const backendUrl = process.env.FAST_API_URL || 'http://localhost:8000';
+        const backendUrl = process.env.FASTAPI_URL || 'http://localhost:8000';
         return [
             {
                 source: '/api/:path*',
