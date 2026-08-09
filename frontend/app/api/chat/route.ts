@@ -12,7 +12,7 @@ function getBackendBaseUrl(): string | null {
 }
 
 export async function POST(req: NextRequest) {
-    const FASTAPI_URL = process.env.FASTAPI_URL
+    const FASTAPI_URL = getBackendBaseUrl()
 
   if (!FASTAPI_URL) {
     return NextResponse.json(
