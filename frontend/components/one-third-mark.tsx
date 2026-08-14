@@ -1,22 +1,44 @@
+import Image from 'next/image'
 import { cn } from '@/lib/utils'
 
-export function OneThirdMark({ className }: { className?: string }) {
+type OneThirdMarkProps = {
+  className?: string
+  /** Show wordmark text beside the mark (nav/footer). */
+  withWordmark?: boolean
+  priority?: boolean
+}
+
+export function OneThirdMark({
+  className,
+  withWordmark = false,
+  priority = false,
+}: OneThirdMarkProps) {
+  if (withWordmark) {
+    return (
+      <span className={cn('inline-flex items-center gap-2.5', className)}>
+        <Image
+          src="/images/one-third-logo.png"
+          alt="ONE-THIRD"
+          width={160}
+          height={160}
+          priority={priority}
+          className="size-9 rounded-md object-cover shadow-sm ring-1 ring-border/60"
+        />
+        <span className="font-heading text-base font-bold tracking-[0.08em] text-primary">
+          ONE-THIRD
+        </span>
+      </span>
+    )
+  }
+
   return (
-    <svg
-      viewBox="0 0 32 32"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      className={cn('text-primary', className)}
-      aria-hidden="true"
-    >
-      <circle cx="16" cy="16" r="15" stroke="currentColor" strokeWidth="2" />
-      <path
-        d="M16 7v10.5L22 21"
-        stroke="currentColor"
-        strokeWidth="2.25"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <Image
+      src="/images/one-third-logo.png"
+      alt="ONE-THIRD"
+      width={160}
+      height={160}
+      priority={priority}
+      className={cn('rounded-md object-cover shadow-sm ring-1 ring-border/60', className)}
+    />
   )
 }

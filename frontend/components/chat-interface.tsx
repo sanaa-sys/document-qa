@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { ArrowUp, BookText, Loader2, Stethoscope } from 'lucide-react'
+import { ArrowUp, BookText, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { OneThirdMark } from '@/components/one-third-mark'
 import { cn } from '@/lib/utils'
 
 type Source = { title?: string; source?: string; page?: number | string } | string
@@ -118,12 +119,10 @@ export function ChatInterface() {
             <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6 md:px-6">
                 {messages.length === 0 ? (
                     <div className="mx-auto flex max-w-md flex-col items-center gap-5 py-10 text-center">
-                        <span className="inline-flex size-14 items-center justify-center rounded-2xl bg-primary/12 text-primary">
-                            <Stethoscope className="size-7" />
-                        </span>
+                        <OneThirdMark className="size-16" />
                         <div className="flex flex-col gap-1.5">
-                            <h2 className="font-heading text-xl font-semibold">
-                                Hi, I&apos;m One Third
+                            <h2 className="font-heading text-xl font-semibold text-primary">
+                                Hi, I&apos;m ONE-THIRD
                             </h2>
                             <p className="leading-relaxed text-muted-foreground text-pretty">
                                 Ask me a health question and I&apos;ll answer with information

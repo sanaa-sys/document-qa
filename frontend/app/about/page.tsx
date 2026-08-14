@@ -55,25 +55,25 @@ export default function AboutPage() {
             {/* Hero */}
             <section className="mx-auto grid w-full max-w-6xl items-center gap-10 px-5 py-14 md:grid-cols-2 md:py-20">
                 <div className="flex flex-col items-start gap-6">
-                    <span className="inline-flex items-center gap-2 rounded-full bg-accent/25 px-3.5 py-1.5 text-sm font-semibold text-accent-foreground">
-                        <Sparkles className="size-4" />
-                        Meet One Third
+                    <span className="inline-flex items-center gap-2 rounded-full bg-accent/35 px-3.5 py-1.5 text-sm font-semibold text-accent-foreground">
+                        <Sparkles className="size-4 text-primary" />
+                        Meet ONE-THIRD
                     </span>
-                    <h1 className="font-heading text-4xl font-bold leading-tight tracking-tight text-balance md:text-5xl">
-                        Your caring medical assistant, ready whenever you need it.
+                    <h1 className="font-heading text-4xl font-bold leading-tight tracking-tight text-balance text-primary md:text-5xl">
+                        ONE-THIRD
                     </h1>
                     <p className="max-w-md text-lg leading-relaxed text-muted-foreground text-pretty">
-                        One Third answers your health questions with warmth and clarity —
+                        Your caring medical assistant — answers with warmth and clarity,
                         grounded in real medical sources so you can trust what you read.
                     </p>
                     <div className="flex flex-wrap items-center gap-3">
-                        <Button size="lg" className="h-11 px-6 text-base" render={<Link href="/chatbot" />}>
+                        <Button size="lg" className="h-11 rounded-xl px-6 text-base" render={<Link href="/chatbot" />}>
                             Start chatting
                         </Button>
                         <Button
                             size="lg"
                             variant="outline"
-                            className="h-11 px-6 text-base"
+                            className="h-11 rounded-xl px-6 text-base"
                             render={<Link href="/feedback" />}
                         >
                             Share feedback
@@ -81,16 +81,16 @@ export default function AboutPage() {
                     </div>
                 </div>
 
-                <div className="relative">
-                    <div className="absolute -inset-3 -z-10 rounded-[2rem] bg-accent/20 blur-2xl" />
-                    <div className="overflow-hidden rounded-[2rem] border border-border/70 bg-card shadow-sm">
+                <div className="relative flex items-center justify-center">
+                    <div className="absolute -inset-6 -z-10 rounded-[2rem] bg-gradient-to-br from-accent/50 via-brand-sky/25 to-primary/20 blur-2xl" />
+                    <div className="overflow-hidden rounded-[2rem] border border-border/70 bg-black p-6 shadow-sm sm:p-8">
                         <Image
-                            src="/images/hero-care.png"
-                            alt="Illustration of a caring doctor talking with a patient"
+                            src="/images/one-third-logo.png"
+                            alt="ONE-THIRD logo — wind, water, and growth"
                             width={640}
-                            height={520}
+                            height={640}
                             priority
-                            className="h-full w-full object-cover"
+                            className="mx-auto h-auto w-full max-w-md object-contain"
                         />
                     </div>
                 </div>
@@ -151,8 +151,8 @@ export default function AboutPage() {
                         One Third is here to help you understand it — kindly, clearly, and
                         grounded in real medical knowledge.
                     </p>
-                    <Button size="lg" className="h-11 px-6 text-base" render={<Link href="/chatbot" />}>
-                        Talk to One Third
+                    <Button size="lg" className="h-11 rounded-xl px-6 text-base" render={<Link href="/chatbot" />}>
+                        Talk to ONE-THIRD
                     </Button>
                 </div>
             </section>

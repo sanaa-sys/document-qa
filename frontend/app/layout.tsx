@@ -19,17 +19,20 @@ const poppins = Poppins({
 })
 
 export const metadata: Metadata = {
-    title: 'One Third — Your caring medical assistant',
+    title: 'ONE-THIRD — Your caring medical assistant',
     description:
-        'One Third is a warm, approachable medical RAG chatbot that answers your health questions with grounded, trustworthy information.',
-    generator: 'v0.app',
+        'ONE-THIRD is a warm, approachable medical RAG chatbot that answers your health questions with grounded, trustworthy information.',
+    icons: {
+        icon: [{ url: '/favicon.png', type: 'image/png' }],
+        apple: '/favicon.png',
+    },
 }
 
 export const viewport: Viewport = {
     colorScheme: 'light dark',
     themeColor: [
-        { media: '(prefers-color-scheme: light)', color: '#fbf6f0' },
-        { media: '(prefers-color-scheme: dark)', color: '#2b2420' },
+        { media: '(prefers-color-scheme: light)', color: '#f3fbfd' },
+        { media: '(prefers-color-scheme: dark)', color: '#06181d' },
     ],
 }
 
