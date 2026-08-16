@@ -7,6 +7,8 @@ const EMAILJS_TEMPLATE_ID =
 const EMAILJS_PUBLIC_KEY =
   process.env.EMAILJS_PUBLIC_KEY?.trim() || '9hZIx33OKAeoBcUaB'
 const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY?.trim() || ''
+const EMAILJS_TO_EMAIL =
+  process.env.EMAILJS_TO_EMAIL?.trim() || 'onethird073@gmail.com'
 
 function getBackendBaseUrl(): string | null {
   const raw =
@@ -42,6 +44,8 @@ async function sendFeedbackEmail(payload: {
   ].join('\n')
 
   const templateParams = {
+    to_email: EMAILJS_TO_EMAIL,
+    email: EMAILJS_TO_EMAIL,
     from_name: 'ONE-THIRD Feedback',
     subject: `ONE-THIRD feedback — rating ${payload.rating || 0}/5`,
     rating: stars(payload.rating),
