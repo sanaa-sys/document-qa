@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { CheckCircle2, Loader2, Star } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { sendFeedbackEmail } from '@/lib/send-feedback-email'
 import { cn } from '@/lib/utils'
 
 const CATEGORY_OPTIONS = [
@@ -72,25 +73,30 @@ export function FeedbackForm() {
 
         setStatus('submitting')
         setErrorMsg('')
+        const payload = {
+            rating,
+            accuracy,
+            categories,
+            comments: comments.trim(),
+        }
         try {
-            const res = await fetch('/api/feedback', {
+            await sendFeedbackEmail(payload)
+            void fetch('/api/feedback', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    rating,
-                    accuracy,
-                    categories,
-                    comments: comments.trim(),
-                }),
-            })
-            if (!res.ok) {
-                const data = await res.json().catch(() => null)
-                throw new Error(data?.error ?? 'Something went wrong.')
-            }
+                body: JSON.stringify(payload),
+            }).catch(() => {})
             setStatus('done')
         } catch (err) {
             setStatus('error')
-            setErrorMsg(err instanceof Error ? err.message : 'Something went wrong.')
+            const text =
+                err && typeof err === 'object' && 'text' in err
+                    ? String((err as { text?: string }).text)
+                    : ''
+            setErrorMsg(
+                text ||
+                    (err instanceof Error ? err.message : 'Could not send feedback. Please try again.'),
+            )
         }
     }
 
