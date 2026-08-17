@@ -13,7 +13,7 @@ import {
 export const metadata: Metadata = {
     title: 'About',
     description:
-       'Your caring health companion — answers with warmth and clarity, grounded in authentic Prophetic wisdom and modern medical sources so you can trust what you read..',
+       'Your caring health companion — answers with warmth and clarity, grounded in authentic Prophetic wisdom and modern medical sources so you can trust what you read.',
 }
 
 const features = [
@@ -63,8 +63,7 @@ export default function AboutPage() {
                         ONE-THIRD
                     </h1>
                     <p className="max-w-md text-lg leading-relaxed text-muted-foreground text-pretty">
-                        Your caring medical assistant — answers with warmth and clarity,
-                        grounded in real medical sources so you can trust what you read.
+                        Your caring health companion — answers with warmth and clarity, grounded in authentic Prophetic wisdom and modern medical sources so you can trust what you read.
                     </p>
                     <div className="flex flex-wrap items-center gap-3">
                         <Button size="lg" className="h-11 rounded-xl px-6 text-base" render={<Link href="/chatbot" />}>
