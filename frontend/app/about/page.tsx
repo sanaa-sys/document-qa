@@ -13,7 +13,7 @@ import {
 export const metadata: Metadata = {
     title: 'About',
     description:
-        'One Third is a caring medical assistant that answers health questions with warmth and clarity, grounded in real medical sources.',
+       ' Your caring medical assistant — answers with warmth and clarity, grounded in real medical sources so you can trust what you read.',
 }
 
 const features = [

@@ -18,8 +18,8 @@ type Message = {
 
 const suggestions = [
     'What are the benefits of date?',
-    'How to treat PCOS?',
-    'How to improve hyfration?',
+    'How to treat PCOS (PMOS)?',
+    'How to improve hydration?',
 ]
 
 function sourceLabel(s: Source): string {
