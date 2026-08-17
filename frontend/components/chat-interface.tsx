@@ -20,7 +20,7 @@ type Message = {
 const suggestions = [
     'What are the benefits of date?',
     'How to treat PCOS (PMOS)?',
-    'How to improve hydration?',
+    'How is Salah healing and therapeutic?',
 ]
 
 function sourceLabel(s: Source): string {
