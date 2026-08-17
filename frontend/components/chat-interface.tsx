@@ -18,7 +18,7 @@ type Message = {
 }
 
 const suggestions = [
-    'What are the benefits of date?',
+    'What are the benefits of eating dates?',
     'How to treat PCOS (PMOS)?',
     'How is Salah healing and therapeutic?',
 ]
