@@ -13,7 +13,7 @@ import {
 export const metadata: Metadata = {
     title: 'About',
     description:
-       ' Your caring medical assistant — answers with warmth and clarity, grounded in real medical sources so you can trust what you read.',
+       'Your caring health companion — answers with warmth and clarity, grounded in authentic Prophetic wisdom and modern medical sources so you can trust what you read..',
 }
 
 const features = [
