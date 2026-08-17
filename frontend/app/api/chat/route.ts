@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from 'next/server'
+import { stripThinkTags } from '@/lib/strip-think'
 
 /**
  * Resolve the FastAPI base URL from common env names and strip
@@ -67,8 +68,9 @@ export async function POST(req: NextRequest) {
 
     const data = await upstream.json().catch(() => null)
 
-    const answer =
-      data?.answer ?? data?.response ?? data?.reply ?? data?.message ?? ''
+    const answer = stripThinkTags(
+      String(data?.answer ?? data?.response ?? data?.reply ?? data?.message ?? ''),
+    )
     const sources = data?.sources ?? data?.citations ?? []
     const confidence = typeof data?.confidence === 'number' ? data.confidence : null
 

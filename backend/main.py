@@ -8,6 +8,7 @@ from groq import Groq
 import json
 import os
 from datetime import datetime
+import re
 
 app = FastAPI(title="MedChat API")
 
@@ -94,50 +95,123 @@ def retrieve_chunks(question: str, top_k: int = 5) -> list:
     return results
 
 
+def strip_think_tags(text: str) -> str:
+    """Remove model reasoning tags, including unclosed <think> blocks."""
+    if not text:
+        return text
+    cleaned = re.sub(
+        r'<think(?:ing)?>.*?</think(?:ing)?>',
+        '',
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r'<think(?:ing)?>.*$',
+        '',
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(r'</?think(?:ing)?>', '', cleaned, flags=re.IGNORECASE)
+    return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
+
 def generate_answer(question: str, chunks: list) -> tuple:
+    """Generate answer using retrieved context with improved response quality."""
+    
     if not chunks:
         return "I don't have sufficient information in the medical documents to answer that question.", []
-
+    
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
-        context = "\n\n".join([c["text"] for c in chunks])
-        return f"No Groq API key found. Raw passages:\n\n{context}", []
-
+        context = "\n\n".join([c["text"] for c in chunks[:5]])
+        return (
+            "I couldn't connect to the AI service due to a configuration issue. "
+            "However, here's the relevant information from the documents:\n\n"
+            f"{context}", 
+            []
+        )
+    
     try:
         client = Groq(api_key=api_key)
-        context = "\n\n---\n\n".join(
-            [f"[Page {c['page']}] {c['text']}" for c in chunks]
-        )
-
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a medical knowledge assistant. "
-                        "Answer using ONLY the provided context from medical documents. "
-                        "If the information isn't in the context, say you don't have "
-                        "sufficient information to answer."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:",
-                },
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=500,
-        )
-
-        answer = response.choices[0].message.content
-        sources = [
-            {"page": c["page"], "source": c["source"], "score": c["score"]}
-            for c in chunks
+        
+        # Format context with clear separators and page references
+        context_parts = [
+            f"Source [Page {c['page']}]: {c['text']}"
+            for c in chunks[:5]  # Limit to top 5 most relevant
         ]
+        context = "\n\n---\n\n".join(context_parts)
+        
+        # Improved system prompt for better response quality
+        system_instruction = (
+            "You are a medical knowledge assistant providing accurate, well-formatted responses. "
+            "Follow these guidelines strictly:\n\n"
+            "1. Answer ONLY using the provided context from medical documents.\n"
+            "2. If the information isn't in the context, state clearly: 'I don't have sufficient "
+            "information in the medical documents to answer that question.'\n"
+            "3. Write in clear, professional language with complete sentences.\n"
+            "4. Use bullet points or numbered lists when presenting multiple pieces of information.\n"
+            "5. Cite page numbers when referencing specific information (e.g., 'According to page 49...').\n"
+            "6. Avoid speculation, generalizations, or adding information outside the context.\n"
+            "7. If context is contradictory, acknowledge the discrepancy.\n\n"
+            "Format your response with:\n"
+            "- A direct answer to the question in the first paragraph\n"
+            "- Supporting details organized logically\n"
+            "- Clear attribution to source pages\n\n"
+            "Never include <think> tags, chain-of-thought, or internal reasoning in the reply."
+        )
+        
+        user_prompt = (
+            f"CONTEXT FROM MEDICAL DOCUMENTS:\n{'='*50}\n{context}\n{'='*50}\n\n"
+            f"QUESTION: {question}\n\n"
+            "Provide a well-structured, professional answer following all guidelines above."
+        )
+        
+        create_kwargs = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": TEMPERATURE,
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        # Qwen reasoning models otherwise dump <think> into the user-visible answer.
+        if "qwen" in GROQ_MODEL.lower():
+            create_kwargs["reasoning_format"] = "hidden"
+            create_kwargs["reasoning_effort"] = "none"
+
+        try:
+            response = client.chat.completions.create(**create_kwargs)
+        except Exception:
+            create_kwargs.pop("reasoning_format", None)
+            create_kwargs.pop("reasoning_effort", None)
+            response = client.chat.completions.create(**create_kwargs)
+        
+        answer = strip_think_tags(response.choices[0].message.content or "")
+        if not answer:
+            answer = "I couldn't produce a clear answer from the documents. Please try asking again."
+        
+        # Clean sources to include only essential metadata
+        sources = [
+            {
+                "page": c["page"],
+                "source": os.path.basename(c["source"]) if c["source"] else "Document",
+                "score": round(c["score"], 3)
+            }
+            for c in chunks[:5]
+        ]
+        
         return answer, sources
+    
     except Exception as e:
-        return f"Error generating answer: {str(e)}", []
+        error_detail = str(e)
+        # Don't expose internal error details to users
+        return (
+            "I encountered an error while generating the response. "
+            "Please try again with your question.",
+            []
+        )
 
 
 # ──────────────────────────────────────────────

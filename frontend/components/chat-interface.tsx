@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { ArrowUp, BookText, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { OneThirdMark } from '@/components/one-third-mark'
+import { stripThinkTags } from '@/lib/strip-think'
 import { cn } from '@/lib/utils'
 
 type Source = { title?: string; source?: string; page?: number | string } | string
@@ -81,7 +82,9 @@ export function ChatInterface() {
                     {
                         id: crypto.randomUUID(),
                         role: 'assistant',
-                        content: data.answer || 'I could not find an answer for that.',
+                        content:
+                            stripThinkTags(data.answer || '') ||
+                            'I could not find an answer for that.',
                         sources: Array.isArray(data.sources) ? data.sources : [],
                     },
                 ])
