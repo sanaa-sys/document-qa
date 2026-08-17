@@ -16,8 +16,8 @@ app = FastAPI(title="MedChat API")
 # ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",       "https://document-qa-six.vercel.app",
-        "https://document-qa-six.vercel.app/*","*"],  # Add production URL later
+    allow_origins=["http://localhost:3000",       "https://1-3rd.vercel.app",
+        "https://1-3rd.vercel.app/*","*"],  # Add production URL later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,7 +27,7 @@ app.add_middleware(
 # CONFIG
 # ──────────────────────────────────────────────
 # llama3-8b-8192 was decommissioned; override with GROQ_MODEL if needed.
-GROQ_MODEL =  "llama-3.1-8b-instant"
+GROQ_MODEL =  "llama-3.3-70b-versatile"
 TEMPERATURE = 0.1
 FEEDBACK_FILE = os.path.join(os.path.dirname(__file__), "data", "feedback_log.json")
 
