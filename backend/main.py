@@ -27,7 +27,7 @@ app.add_middleware(
 # CONFIG
 # ──────────────────────────────────────────────
 # llama3-8b-8192 was decommissioned; override with GROQ_MODEL if needed.
-GROQ_MODEL =  "llama-3.3-70b-versatile"
+GROQ_MODEL =  "qwen/qwen3.6-27b"
 TEMPERATURE = 0.1
 FEEDBACK_FILE = os.path.join(os.path.dirname(__file__), "data", "feedback_log.json")
 
