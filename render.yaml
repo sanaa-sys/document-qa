@@ -2,10 +2,10 @@ services:
   - type: web
     name: document-qa-api
     runtime: python
-    rootDir: backend
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Paths are from the repo root (document-qa), not backend/
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn main:app --app-dir backend --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
