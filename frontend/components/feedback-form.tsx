@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import posthog from 'posthog-js'
 import { CheckCircle2, Loader2, Star } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { sendFeedbackEmail } from '@/lib/send-feedback-email'
@@ -86,8 +87,15 @@ export function FeedbackForm() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             }).catch(() => {})
+            posthog.capture('feedback_submitted', {
+                rating: payload.rating,
+                accuracy: payload.accuracy,
+                category_count: payload.categories.length,
+                categories: payload.categories,
+            })
             setStatus('done')
         } catch (err) {
+            posthog.capture('feedback_failed')
             setStatus('error')
             const text =
                 err && typeof err === 'object' && 'text' in err

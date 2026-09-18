@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import posthog from 'posthog-js'
 import { ArrowUp, BookText, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { OneThirdMark } from '@/components/one-third-mark'
@@ -67,6 +68,10 @@ export function ChatInterface() {
             const data = await res.json()
 
             if (!res.ok) {
+                posthog.capture('chat_message_failed', {
+                    status: res.status,
+                    message_length: trimmed.length,
+                })
                 setMessages((prev) => [
                     ...prev,
                     {
@@ -77,6 +82,11 @@ export function ChatInterface() {
                     },
                 ])
             } else {
+                posthog.capture('chat_message_sent', {
+                    message_length: trimmed.length,
+                    has_sources: Array.isArray(data.sources) && data.sources.length > 0,
+                    source_count: Array.isArray(data.sources) ? data.sources.length : 0,
+                })
                 setMessages((prev) => [
                     ...prev,
                     {
@@ -90,6 +100,10 @@ export function ChatInterface() {
                 ])
             }
         } catch {
+            posthog.capture('chat_message_failed', {
+                status: 0,
+                message_length: trimmed.length,
+            })
             setMessages((prev) => [
                 ...prev,
                 {
