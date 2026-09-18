@@ -2,20 +2,30 @@ services:
   - type: web
     name: document-qa-api
     runtime: python
-    # Repo is document-qa → Root Directory in Render UI must be: backend
-    # (enter "backend", not "document-qa/backend")
+    # In Render dashboard: Root Directory = backend
     rootDir: backend
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    # Single worker so we stay under 512MB
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      - key: LOAD_EMBEDDING_ON_STARTUP
+        value: "false"
+      - key: LOAD_FAISS_ON_STARTUP
+        value: "false"
+      - key: INGEST_ON_STARTUP
+        value: "false"
       - key: GROQ_API_KEY
         sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: INGEST_ON_STARTUP
-        value: "false"

@@ -2,13 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-from sentence_transformers import SentenceTransformer
 from groq import Groq
 import json
 import os
 from datetime import datetime
 import re
 
+try:
+    import faiss
+except ImportError:  # pragma: no cover
+    faiss = None
 
 try:
     from dotenv import load_dotenv
@@ -51,6 +54,7 @@ MATCH_THRESHOLD = 0.3
 INDEX = None
 CHUNKS = None
 MODEL = None
+MODEL_BACKEND = None  # "fastembed" | "sentence-transformers"
 SUPABASE = None
 
 
@@ -76,10 +80,38 @@ def get_supabase():
 
 
 def ensure_model():
-    global MODEL
-    if MODEL is None:
-        MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    """Lazy-load embeddings. Prefer fastembed (ONNX) so Render 512MB can boot."""
+    global MODEL, MODEL_BACKEND
+    if MODEL is not None:
+        return MODEL
+
+    # Prefer ONNX via fastembed — much lighter than torch + sentence-transformers.
+    try:
+        from fastembed import TextEmbedding
+
+        MODEL = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
+        MODEL_BACKEND = "fastembed"
+        print(f"✅ Embedding backend: fastembed ({EMBEDDING_MODEL_NAME})")
+        return MODEL
+    except Exception as e:
+        print(f"⚠️ fastembed unavailable ({e}); trying sentence-transformers")
+
+    from sentence_transformers import SentenceTransformer
+
+    MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    MODEL_BACKEND = "sentence-transformers"
+    print(f"✅ Embedding backend: sentence-transformers ({EMBEDDING_MODEL_NAME})")
     return MODEL
+
+
+def embed_texts(texts: list) -> list:
+    """Return L2-normalized embedding vectors as Python lists."""
+    model = ensure_model()
+    if MODEL_BACKEND == "fastembed":
+        return [list(vec) for vec in model.embed(texts)]
+
+    vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return [vector.tolist() for vector in vectors]
 
 
 def count_supabase_chunks() -> Optional[int]:
@@ -96,31 +128,41 @@ def count_supabase_chunks() -> Optional[int]:
 
 @app.on_event("startup")
 async def load_rag():
-    global INDEX, CHUNKS, MODEL
-    try:
-        MODEL = ensure_model()
-        print(f"✅ Embedding model loaded: {EMBEDDING_MODEL_NAME}")
-    except Exception as e:
-        print(f"⚠️ Embedding model load failed: {e}")
+    """Boot fast: do not load embedding models or FAISS unless explicitly asked.
 
-    try:
-        index_path = os.path.join(DATA_DIR, "faiss_index.bin")
-        chunks_path = os.path.join(DATA_DIR, "chunks_data.json")
-        if faiss is not None and os.path.exists(index_path) and os.path.exists(chunks_path):
-            INDEX = faiss.read_index(index_path)
-            with open(chunks_path, "r") as f:
-                CHUNKS = json.load(f)
-            print(f"✅ FAISS loaded: {len(CHUNKS)} chunks indexed")
-        elif faiss is None:
-            print("⚠️ FAISS not installed; using Supabase retrieval only")
-    except Exception as e:
-        print(f"⚠️ FAISS load failed: {e}")
+    Loading torch/SentenceTransformer at startup OOMs Render's 512MB plan and
+    prevents the process from binding $PORT.
+    """
+    global INDEX, CHUNKS
 
     supabase_count = count_supabase_chunks()
     if supabase_count is None:
         print("⚠️ Supabase not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)")
     else:
         print(f"✅ Supabase connected: {supabase_count} chunks")
+
+    load_faiss = os.getenv("LOAD_FAISS_ON_STARTUP", "").strip().lower() in ("1", "true", "yes")
+    if load_faiss:
+        try:
+            index_path = os.path.join(DATA_DIR, "faiss_index.bin")
+            chunks_path = os.path.join(DATA_DIR, "chunks_data.json")
+            if faiss is not None and os.path.exists(index_path) and os.path.exists(chunks_path):
+                INDEX = faiss.read_index(index_path)
+                with open(chunks_path, "r") as f:
+                    CHUNKS = json.load(f)
+                print(f"✅ FAISS loaded: {len(CHUNKS)} chunks indexed")
+            elif faiss is None:
+                print("⚠️ FAISS not installed; using Supabase retrieval only")
+        except Exception as e:
+            print(f"⚠️ FAISS load failed: {e}")
+
+    if os.getenv("LOAD_EMBEDDING_ON_STARTUP", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            ensure_model()
+        except Exception as e:
+            print(f"⚠️ Embedding model load failed: {e}")
+    else:
+        print("ℹ️ Embeddings will load lazily on first /chat (saves RAM at boot)")
 
     if os.getenv("INGEST_ON_STARTUP", "").strip().lower() in ("1", "true", "yes"):
         try:
@@ -229,7 +271,6 @@ def ingest_data_files(force: bool = False) -> dict:
             "and run backend/supabase_schema.sql in the Supabase SQL editor."
         )
 
-    model = ensure_model()
     pdfs = list_pdf_files()
     if not pdfs:
         return {"ingested_files": [], "skipped_files": [], "chunks_upserted": 0}
@@ -257,13 +298,9 @@ def ingest_data_files(force: bool = False) -> dict:
             print(f"⚠️ No extractable text in {source}")
             continue
 
-        embeddings = model.encode(
-            [row["text"] for row in rows],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        embeddings = embed_texts([row["text"] for row in rows])
         for row, vector in zip(rows, embeddings):
-            row["embedding"] = vector.tolist()
+            row["embedding"] = vector
 
         upsert_chunk_batch(client, rows)
         ingested.append(source)
@@ -280,10 +317,15 @@ def ingest_data_files(force: bool = False) -> dict:
 
 def retrieve_chunks_from_supabase(question: str, top_k: int = 5) -> list:
     client = get_supabase()
-    if client is None or MODEL is None:
+    if client is None:
         return []
 
-    question_vec = MODEL.encode([question], normalize_embeddings=True)[0].tolist()
+    try:
+        question_vec = embed_texts([question])[0]
+    except Exception as e:
+        print(f"⚠️ Embedding failed: {e}")
+        return []
+
     try:
         res = client.rpc(
             "match_document_chunks",
@@ -316,12 +358,24 @@ def retrieve_chunks(question: str, top_k: int = 5) -> list:
     if supabase_hits:
         return supabase_hits
 
-    if faiss is None or INDEX is None or CHUNKS is None or MODEL is None:
+    if faiss is None or INDEX is None or CHUNKS is None:
         return []
 
-    question_vec = MODEL.encode([question])
-    faiss.normalize_L2(question_vec)
-    distances, indices = INDEX.search(question_vec.astype("float32"), top_k)
+    try:
+        model = ensure_model()
+    except Exception:
+        return []
+
+    question_vec = model.encode([question]) if MODEL_BACKEND != "fastembed" else None
+    if MODEL_BACKEND == "fastembed":
+        import numpy as np
+
+        question_vec = np.array(embed_texts([question]), dtype="float32")
+    else:
+        question_vec = question_vec.astype("float32")
+        faiss.normalize_L2(question_vec)
+
+    distances, indices = INDEX.search(question_vec, top_k)
 
     results = []
     for dist, idx in zip(distances[0], indices[0]):
@@ -473,6 +527,8 @@ async def health():
         "faiss_chunks": faiss_chunks,
         "supabase_configured": get_supabase() is not None,
         "supabase_chunks": supabase_chunks,
+        "embedding_loaded": MODEL is not None,
+        "embedding_backend": MODEL_BACKEND,
         "pdf_files": [os.path.basename(p) for p in list_pdf_files()],
         "groq_model": GROQ_MODEL,
     }
