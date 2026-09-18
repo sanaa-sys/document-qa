@@ -2,13 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import faiss
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 import json
 import os
 from datetime import datetime
 import re
+
 
 try:
     from dotenv import load_dotenv
@@ -106,11 +106,13 @@ async def load_rag():
     try:
         index_path = os.path.join(DATA_DIR, "faiss_index.bin")
         chunks_path = os.path.join(DATA_DIR, "chunks_data.json")
-        if os.path.exists(index_path) and os.path.exists(chunks_path):
+        if faiss is not None and os.path.exists(index_path) and os.path.exists(chunks_path):
             INDEX = faiss.read_index(index_path)
             with open(chunks_path, "r") as f:
                 CHUNKS = json.load(f)
             print(f"✅ FAISS loaded: {len(CHUNKS)} chunks indexed")
+        elif faiss is None:
+            print("⚠️ FAISS not installed; using Supabase retrieval only")
     except Exception as e:
         print(f"⚠️ FAISS load failed: {e}")
 
@@ -314,7 +316,7 @@ def retrieve_chunks(question: str, top_k: int = 5) -> list:
     if supabase_hits:
         return supabase_hits
 
-    if INDEX is None or CHUNKS is None or MODEL is None:
+    if faiss is None or INDEX is None or CHUNKS is None or MODEL is None:
         return []
 
     question_vec = MODEL.encode([question])
