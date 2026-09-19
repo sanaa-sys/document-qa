@@ -1,3 +1,4 @@
+import hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,7 +16,7 @@ except ImportError:  # pragma: no cover
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 except ImportError:
     pass
 
@@ -26,8 +27,12 @@ app = FastAPI(title="MedChat API")
 # ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",       "https://1-3rd.vercel.app",
-        "https://1-3rd.vercel.app/*","*"],  # Add production URL later
+    allow_origins=[
+        "http://localhost:3000",
+        "https://1-3rd.vercel.app",
+        "https://1-3rd.vercel.app/*",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,21 +41,21 @@ app.add_middleware(
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
-# llama3-8b-8192 was decommissioned; override with GROQ_MODEL if needed.
-GROQ_MODEL =  "qwen/qwen3.8-27b"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 TEMPERATURE = 0.1
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback_log.json")
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
 EMBEDDING_DIM = 384
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 200
 INGEST_BATCH_SIZE = 50
-MATCH_THRESHOLD = 0.3
+MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.05"))
+MATCH_COUNT = int(os.getenv("MATCH_COUNT", "5"))
 
-# ──────────────────────────────────────────────
-# LOAD RAG COMPONENTS AT STARTUP
-# ──────────────────────────────────────────────
 INDEX = None
 CHUNKS = None
 MODEL = None
@@ -58,23 +63,26 @@ MODEL_BACKEND = None  # "fastembed" | "sentence-transformers"
 SUPABASE = None
 
 
+def _normalize_supabase_url(url: str) -> str:
+    """Accept project URL or accidental /rest/v1 suffix."""
+    cleaned = (url or "").strip().strip("'\"")
+    cleaned = re.sub(r"/rest/v1/?$", "", cleaned)
+    return cleaned.rstrip("/")
+
+
 def get_supabase():
     global SUPABASE
     if SUPABASE is not None:
         return SUPABASE
-
-    url = (os.getenv("SUPABASE_URL") or "").strip().strip("'\"")
-    key = (
-        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        or os.getenv("SUPABASE_KEY")
-        or os.getenv("SUPABASE_ANON_KEY")
-        or ""
-    ).strip().strip("'\"")
+        
+    url = _normalize_supabase_url(os.getenv("SUPABASE_URL", ""))
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     if not url or not key:
         return None
 
     from supabase import create_client
 
+    # supabase-py appends /rest/v1 itself; passing that suffix causes PGRST125.
     SUPABASE = create_client(url, key)
     return SUPABASE
 
@@ -85,7 +93,6 @@ def ensure_model():
     if MODEL is not None:
         return MODEL
 
-    # Prefer ONNX via fastembed — much lighter than torch + sentence-transformers.
     try:
         from fastembed import TextEmbedding
 
@@ -96,50 +103,193 @@ def ensure_model():
     except Exception as e:
         print(f"⚠️ fastembed unavailable ({e}); trying sentence-transformers")
 
-    from sentence_transformers import SentenceTransformer
+    try:
+        from sentence_transformers import SentenceTransformer
 
-    MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    MODEL_BACKEND = "sentence-transformers"
-    print(f"✅ Embedding backend: sentence-transformers ({EMBEDDING_MODEL_NAME})")
-    return MODEL
+        MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        MODEL_BACKEND = "sentence-transformers"
+        print(f"✅ Embedding backend: sentence-transformers ({EMBEDDING_MODEL_NAME})")
+        return MODEL
+    except Exception as e:
+        raise RuntimeError(
+            "No embedding backend installed. From the backend folder run: "
+            "pip install fastembed"
+        ) from e
 
 
 def embed_texts(texts: list) -> list:
-    """Return L2-normalized embedding vectors as Python lists."""
+    """Return L2-normalized embedding vectors as plain Python float lists."""
     model = ensure_model()
     if MODEL_BACKEND == "fastembed":
-        return [list(vec) for vec in model.embed(texts)]
+        return [[float(x) for x in vec] for vec in model.embed(texts)]
 
-    vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    return [vector.tolist() for vector in vectors]
+    raw = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return [[float(x) for x in vector] for vector in raw]
 
 
-def count_supabase_chunks() -> Optional[int]:
+def file_checksum(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def count_ready_chunks() -> Optional[int]:
     client = get_supabase()
     if client is None:
         return None
     try:
-        res = client.table("document_chunks").select("id", count="exact").limit(1).execute()
+        res = (
+            client.table("chunks")
+            .select("id", count="exact")
+            .limit(1)
+            .execute()
+        )
         return res.count if res.count is not None else 0
     except Exception as e:
-        print(f"⚠️ Supabase count failed: {e}")
+        print(f"⚠️ chunks count failed: {e}")
         return None
+
+
+def count_ready_documents() -> Optional[int]:
+    client = get_supabase()
+    if client is None:
+        return None
+    try:
+        res = (
+            client.table("documents")
+            .select("id", count="exact")
+            .eq("status", "ready")
+            .limit(1)
+            .execute()
+        )
+        return res.count if res.count is not None else 0
+    except Exception as e:
+        print(f"⚠️ documents count failed: {e}")
+        return None
+
+
+def _rows_from_match(data) -> list:
+    results = []
+    for row in data or []:
+        results.append({
+            "text": row.get("text", ""),
+            "page": row.get("page", 0),
+            "source": row.get("source") or row.get("title") or "Document",
+            "title": row.get("title") or row.get("source") or "Document",
+            "document_id": row.get("document_id"),
+            "score": float(row.get("score") or 0.0),
+        })
+    return results
+
+
+def retrieve_chunks_from_supabase(question: str, top_k: int = MATCH_COUNT) -> list:
+    client = get_supabase()
+    if client is None:
+        print("⚠️ Supabase client missing during retrieval")
+        return []
+
+    try:
+        question_vec = embed_texts([question])[0]
+    except Exception as e:
+        print(f"⚠️ Embedding failed: {e}")
+        return []
+
+    if len(question_vec) != EMBEDDING_DIM:
+        print(f"⚠️ Unexpected embedding dim {len(question_vec)} (expected {EMBEDDING_DIM})")
+
+    for threshold in (MATCH_THRESHOLD, 0.0):
+        try:
+            res = client.rpc(
+                "match_chunks",
+                {
+                    "query_embedding": question_vec,
+                    "match_threshold": threshold,
+                    "match_count": top_k,
+                    "filter_document_id": None,
+                },
+            ).execute()
+            hits = _rows_from_match(res.data)
+            if hits:
+                print(f"✅ Vector hits: {len(hits)} (threshold={threshold}, best={hits[0]['score']:.3f})")
+                return hits
+        except Exception as e:
+            print(f"⚠️ match_chunks failed (threshold={threshold}): {e}")
+
+    # Keyword / full-text style fallback via ilike on chunks + join-like title from documents list
+    try:
+        tokens = re.findall(r"[A-Za-z0-9]{3,}", question.lower())[:5]
+        query = client.table("chunks").select("page,text,document_id,documents(title,filename)")
+        if tokens:
+            or_filter = ",".join([f"text.ilike.%{tok}%" for tok in tokens])
+            query = query.or_(or_filter)
+        res = query.limit(top_k).execute()
+        hits = []
+        for row in res.data or []:
+            doc = row.get("documents") or {}
+            hits.append({
+                "text": row.get("text", ""),
+                "page": row.get("page", 0),
+                "source": doc.get("filename") or doc.get("title") or "Document",
+                "title": doc.get("title") or doc.get("filename") or "Document",
+                "document_id": row.get("document_id"),
+                "score": 0.0,
+            })
+        if hits:
+            print(f"✅ Keyword fallback hits: {len(hits)}")
+            return hits
+        print("⚠️ No chunk hits — is the documents/chunks schema empty? Run /ingest.")
+    except Exception as e:
+        print(f"⚠️ Keyword fallback failed: {e}")
+
+    return []
+
+
+def retrieve_chunks(question: str, top_k: int = MATCH_COUNT) -> list:
+    supabase_hits = retrieve_chunks_from_supabase(question, top_k=top_k)
+    if supabase_hits:
+        return supabase_hits
+
+    if faiss is None or INDEX is None or CHUNKS is None:
+        return []
+
+    try:
+        ensure_model()
+    except Exception:
+        return []
+
+    import numpy as np
+
+    question_vec = np.array(embed_texts([question]), dtype="float32")
+    if MODEL_BACKEND != "fastembed" and faiss is not None:
+        faiss.normalize_L2(question_vec)
+
+    distances, indices = INDEX.search(question_vec, top_k)
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < len(CHUNKS) and dist > MATCH_THRESHOLD:
+            results.append({
+                "text": CHUNKS[idx]["text"],
+                "page": CHUNKS[idx]["page"],
+                "source": CHUNKS[idx]["source"],
+                "title": CHUNKS[idx].get("source", "Document"),
+                "score": float(dist),
+            })
+    return results
 
 
 @app.on_event("startup")
 async def load_rag():
-    """Boot fast: do not load embedding models or FAISS unless explicitly asked.
-
-    Loading torch/SentenceTransformer at startup OOMs Render's 512MB plan and
-    prevents the process from binding $PORT.
-    """
+    """Boot fast: do not load embedding models or FAISS unless explicitly asked."""
     global INDEX, CHUNKS
 
-    supabase_count = count_supabase_chunks()
-    if supabase_count is None:
+    docs = count_ready_documents()
+    chunks = count_ready_chunks()
+    if docs is None:
         print("⚠️ Supabase not configured (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)")
     else:
-        print(f"✅ Supabase connected: {supabase_count} chunks")
+        print(f"✅ Supabase connected: {docs} ready documents, {chunks} chunks")
 
     load_faiss = os.getenv("LOAD_FAISS_ON_STARTUP", "").strip().lower() in ("1", "true", "yes")
     if load_faiss:
@@ -191,7 +341,7 @@ class FeedbackRequest(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# PDF INGEST → SUPABASE
+# PDF INGEST → documents + chunks
 # ──────────────────────────────────────────────
 def list_pdf_files() -> list:
     if not os.path.isdir(DATA_DIR):
@@ -223,47 +373,167 @@ def chunk_text(text: str, max_chars: int = CHUNK_CHARS, overlap: int = CHUNK_OVE
     return chunks
 
 
-def extract_pdf_chunks(path: str) -> list:
+def extract_pdf_chunks(path: str) -> tuple:
+    """Return (page_count, rows without document_id/embeddings)."""
+    import logging
     from pypdf import PdfReader
 
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+
     reader = PdfReader(path)
-    source = os.path.basename(path)
     rows = []
     for page_number, page in enumerate(reader.pages, start=1):
         try:
             page_text = page.extract_text() or ""
         except Exception:
             page_text = ""
-        for chunk_index, text in enumerate(chunk_text(page_text)):
+        for text in chunk_text(page_text):
             rows.append({
-                "source": source,
                 "page": page_number,
-                "chunk_index": chunk_index,
                 "text": text,
+                "metadata": {"page": page_number},
             })
-    return rows
+
+    # Re-number chunk_index across the whole document
+    for i, row in enumerate(rows):
+        row["chunk_index"] = i
+    return len(reader.pages), rows
 
 
-def already_ingested_sources(client) -> set:
-    try:
-        res = client.table("document_chunks").select("source").execute()
-        return {row["source"] for row in (res.data or [])}
-    except Exception as e:
-        print(f"⚠️ Could not list ingested sources: {e}")
-        return set()
+def get_document_by_filename(client, filename: str) -> Optional[dict]:
+    res = client.table("documents").select("*").eq("filename", filename).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def upsert_chunk_batch(client, rows: list):
     for i in range(0, len(rows), INGEST_BATCH_SIZE):
         batch = rows[i:i + INGEST_BATCH_SIZE]
-        client.table("document_chunks").upsert(
+        client.table("chunks").upsert(
             batch,
-            on_conflict="source,page,chunk_index",
+            on_conflict="document_id,chunk_index",
         ).execute()
 
 
+def list_documents() -> list:
+    client = get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase is not configured.")
+    res = (
+        client.table("documents")
+        .select("id,title,filename,checksum,status,page_count,chunk_count,embedding_model,error,created_at,updated_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+
+def delete_document(document_id: str) -> dict:
+    client = get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase is not configured.")
+    existing = client.table("documents").select("id,filename").eq("id", document_id).limit(1).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+    client.table("documents").delete().eq("id", document_id).execute()
+    return {"deleted": True, "id": document_id, "filename": existing.data[0].get("filename")}
+
+
+def ingest_one_pdf(client, path: str, force: bool = False) -> dict:
+    filename = os.path.basename(path)
+    title = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ").strip() or filename
+    checksum = file_checksum(path)
+    existing = get_document_by_filename(client, filename)
+
+    if existing and not force:
+        if existing.get("checksum") == checksum and existing.get("status") == "ready":
+            return {
+                "filename": filename,
+                "status": "skipped",
+                "reason": "unchanged checksum",
+                "document_id": existing["id"],
+                "chunks_upserted": 0,
+            }
+
+    if existing:
+        document_id = existing["id"]
+        client.table("documents").update({
+            "title": title,
+            "checksum": checksum,
+            "status": "processing",
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "error": None,
+        }).eq("id", document_id).execute()
+        # Replace chunks for this document
+        client.table("chunks").delete().eq("document_id", document_id).execute()
+    else:
+        inserted = client.table("documents").insert({
+            "title": title,
+            "filename": filename,
+            "checksum": checksum,
+            "status": "processing",
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "metadata": {"path": filename},
+        }).execute()
+        document_id = inserted.data[0]["id"]
+
+    try:
+        page_count, rows = extract_pdf_chunks(path)
+        if not rows:
+            client.table("documents").update({
+                "status": "failed",
+                "error": "No extractable text",
+                "page_count": page_count,
+                "chunk_count": 0,
+            }).eq("id", document_id).execute()
+            return {
+                "filename": filename,
+                "status": "failed",
+                "reason": "no extractable text",
+                "document_id": document_id,
+                "chunks_upserted": 0,
+            }
+
+        embeddings = embed_texts([row["text"] for row in rows])
+        chunk_rows = []
+        for row, vector in zip(rows, embeddings):
+            chunk_rows.append({
+                "document_id": document_id,
+                "chunk_index": row["chunk_index"],
+                "page": row["page"],
+                "text": row["text"],
+                "embedding": vector,
+                "embedding_model": EMBEDDING_MODEL_NAME,
+                "metadata": row.get("metadata") or {},
+            })
+
+        upsert_chunk_batch(client, chunk_rows)
+        client.table("documents").update({
+            "status": "ready",
+            "page_count": page_count,
+            "chunk_count": len(chunk_rows),
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "error": None,
+        }).eq("id", document_id).execute()
+
+        print(f"✅ Ingested {filename}: {len(chunk_rows)} chunks ({page_count} pages)")
+        return {
+            "filename": filename,
+            "status": "ingested",
+            "document_id": document_id,
+            "chunks_upserted": len(chunk_rows),
+            "page_count": page_count,
+        }
+    except Exception as e:
+        client.table("documents").update({
+            "status": "failed",
+            "error": str(e)[:500],
+        }).eq("id", document_id).execute()
+        raise
+
+
 def ingest_data_files(force: bool = False) -> dict:
-    """Parse PDFs in ./data, embed chunks, and upsert them into Supabase."""
+    """Parse PDFs in ./data into documents + chunks."""
     client = get_supabase()
     if client is None:
         raise RuntimeError(
@@ -271,122 +541,46 @@ def ingest_data_files(force: bool = False) -> dict:
             "and run backend/supabase_schema.sql in the Supabase SQL editor."
         )
 
+    ensure_model()
+
     pdfs = list_pdf_files()
     if not pdfs:
-        return {"ingested_files": [], "skipped_files": [], "chunks_upserted": 0}
+        return {
+            "ingested_files": [],
+            "skipped_files": [],
+            "failed_files": [],
+            "chunks_upserted": 0,
+            "documents": count_ready_documents(),
+            "chunks": count_ready_chunks(),
+        }
 
-    existing = set() if force else already_ingested_sources(client)
     ingested = []
     skipped = []
+    failed = []
     chunks_upserted = 0
 
     for path in pdfs:
-        source = os.path.basename(path)
-        if source in existing:
-            skipped.append(source)
-            continue
-
-        if force:
-            try:
-                client.table("document_chunks").delete().eq("source", source).execute()
-            except Exception as e:
-                print(f"⚠️ Could not delete existing rows for {source}: {e}")
-
-        rows = extract_pdf_chunks(path)
-        if not rows:
-            skipped.append(source)
-            print(f"⚠️ No extractable text in {source}")
-            continue
-
-        embeddings = embed_texts([row["text"] for row in rows])
-        for row, vector in zip(rows, embeddings):
-            row["embedding"] = vector
-
-        upsert_chunk_batch(client, rows)
-        ingested.append(source)
-        chunks_upserted += len(rows)
-        print(f"✅ Ingested {source}: {len(rows)} chunks")
+        try:
+            result = ingest_one_pdf(client, path, force=force)
+            if result["status"] == "skipped":
+                skipped.append(result["filename"])
+            elif result["status"] == "failed":
+                failed.append(result["filename"])
+            else:
+                ingested.append(result["filename"])
+                chunks_upserted += result.get("chunks_upserted", 0)
+        except Exception as e:
+            failed.append(os.path.basename(path))
+            print(f"⚠️ Ingest failed for {path}: {e}")
 
     return {
         "ingested_files": ingested,
         "skipped_files": skipped,
+        "failed_files": failed,
         "chunks_upserted": chunks_upserted,
-        "supabase_chunks": count_supabase_chunks(),
+        "documents": count_ready_documents(),
+        "chunks": count_ready_chunks(),
     }
-
-
-def retrieve_chunks_from_supabase(question: str, top_k: int = 5) -> list:
-    client = get_supabase()
-    if client is None:
-        return []
-
-    try:
-        question_vec = embed_texts([question])[0]
-    except Exception as e:
-        print(f"⚠️ Embedding failed: {e}")
-        return []
-
-    try:
-        res = client.rpc(
-            "match_document_chunks",
-            {
-                "query_embedding": question_vec,
-                "match_threshold": MATCH_THRESHOLD,
-                "match_count": top_k,
-            },
-        ).execute()
-    except Exception as e:
-        print(f"⚠️ Supabase vector search failed: {e}")
-        return []
-
-    results = []
-    for row in res.data or []:
-        results.append({
-            "text": row.get("text", ""),
-            "page": row.get("page", 0),
-            "source": row.get("source") or "Document",
-            "score": float(row.get("score") or 0.0),
-        })
-    return results
-
-
-# ──────────────────────────────────────────────
-# RAG HELPERS
-# ──────────────────────────────────────────────
-def retrieve_chunks(question: str, top_k: int = 5) -> list:
-    supabase_hits = retrieve_chunks_from_supabase(question, top_k=top_k)
-    if supabase_hits:
-        return supabase_hits
-
-    if faiss is None or INDEX is None or CHUNKS is None:
-        return []
-
-    try:
-        model = ensure_model()
-    except Exception:
-        return []
-
-    question_vec = model.encode([question]) if MODEL_BACKEND != "fastembed" else None
-    if MODEL_BACKEND == "fastembed":
-        import numpy as np
-
-        question_vec = np.array(embed_texts([question]), dtype="float32")
-    else:
-        question_vec = question_vec.astype("float32")
-        faiss.normalize_L2(question_vec)
-
-    distances, indices = INDEX.search(question_vec, top_k)
-
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < len(CHUNKS) and dist > MATCH_THRESHOLD:
-            results.append({
-                "text": CHUNKS[idx]["text"],
-                "page": CHUNKS[idx]["page"],
-                "source": CHUNKS[idx]["source"],
-                "score": float(dist),
-            })
-    return results
 
 
 def strip_think_tags(text: str) -> str:
@@ -430,8 +624,8 @@ def generate_answer(question: str, chunks: list) -> tuple:
         
         # Format context with clear separators and page references
         context_parts = [
-            f"Source [Page {c['page']}]: {c['text']}"
-            for c in chunks[:5]  # Limit to top 5 most relevant
+            f"[{c.get('title') or c.get('source') or 'Document'} · p.{c['page']}]: {c['text']}"
+            for c in chunks[:5]
         ]
         context = "\n\n---\n\n".join(context_parts)
         
@@ -490,8 +684,10 @@ def generate_answer(question: str, chunks: list) -> tuple:
         sources = [
             {
                 "page": c["page"],
-                "source": os.path.basename(c["source"]) if c["source"] else "Document",
-                "score": round(c["score"], 3)
+                "source": os.path.basename(str(c.get("source") or "Document")),
+                "title": c.get("title") or c.get("source") or "Document",
+                "document_id": c.get("document_id"),
+                "score": round(float(c.get("score") or 0), 3),
             }
             for c in chunks[:5]
         ]
@@ -518,20 +714,41 @@ async def root():
 
 @app.get("/health")
 async def health():
-    supabase_chunks = count_supabase_chunks()
+    docs = count_ready_documents()
+    chunks = count_ready_chunks()
     faiss_chunks = len(CHUNKS) if CHUNKS else 0
-    indexed_chunks = supabase_chunks if supabase_chunks is not None else faiss_chunks
+    indexed_chunks = chunks if chunks is not None else faiss_chunks
     return {
         "status": "healthy",
         "indexed_chunks": indexed_chunks,
+        "documents": docs,
+        "chunks": chunks,
         "faiss_chunks": faiss_chunks,
         "supabase_configured": get_supabase() is not None,
-        "supabase_chunks": supabase_chunks,
         "embedding_loaded": MODEL is not None,
         "embedding_backend": MODEL_BACKEND,
+        "embedding_model": EMBEDDING_MODEL_NAME,
         "pdf_files": [os.path.basename(p) for p in list_pdf_files()],
         "groq_model": GROQ_MODEL,
     }
+
+
+@app.get("/documents")
+async def documents_list():
+    try:
+        return {"documents": list_documents()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/{document_id}")
+async def documents_delete(document_id: str):
+    try:
+        return delete_document(document_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ingest")
@@ -546,6 +763,26 @@ async def ingest(force: bool = False):
 async def chat(req: ChatRequest):
     chunks = retrieve_chunks(req.message)
     confidence = sum(c["score"] for c in chunks) / len(chunks) if chunks else 0.0
+    if not chunks:
+        n = count_ready_chunks()
+        docs = count_ready_documents()
+        if n is None:
+            answer = (
+                "The knowledge base is not connected. Set SUPABASE_URL and "
+                "SUPABASE_SERVICE_ROLE_KEY on the API service, then try again."
+            )
+        elif (docs or 0) == 0 or n == 0:
+            answer = (
+                "The knowledge base is empty. Add PDFs to backend/data and run "
+                "POST /ingest (or: python main.py --ingest)."
+            )
+        else:
+            answer = (
+                "I couldn't find relevant passages for that question. "
+                "Try rephrasing, or re-ingest with: python main.py --ingest --force"
+            )
+        return ChatResponse(answer=answer, sources=[], confidence=0.0)
+
     answer, sources = generate_answer(req.message, chunks)
     return ChatResponse(answer=answer, sources=sources, confidence=confidence)
 

@@ -6,7 +6,6 @@ services:
     rootDir: backend
     plan: starter
     buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
-    # Single worker so we stay under 512MB
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: PYTHON_VERSION
@@ -21,6 +20,8 @@ services:
         value: "false"
       - key: LOAD_FAISS_ON_STARTUP
         value: "false"
+      - key: MATCH_THRESHOLD
+        value: "0.05"
       - key: INGEST_ON_STARTUP
         value: "false"
       - key: GROQ_API_KEY
