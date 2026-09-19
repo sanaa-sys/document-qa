@@ -1,6 +1,10 @@
 import hashlib
-from fastapi import FastAPI, HTTPException
+import hmac
+import urllib.error
+import urllib.request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from groq import Groq
@@ -55,6 +59,21 @@ CHUNK_OVERLAP = 200
 INGEST_BATCH_SIZE = 50
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.05"))
 MATCH_COUNT = int(os.getenv("MATCH_COUNT", "5"))
+
+# WhatsApp Cloud API (Meta). Leave unset to disable the WhatsApp bot.
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v21.0").strip() or "v21.0"
+WHATSAPP_MAX_CHARS = 4000
+_PROCESSED_WA_IDS = set()
+_PROCESSED_WA_MAX = 2000
+_WA_GREETING = re.compile(
+    r"^(hi|hello|hey|yo|salam|salaam|assalamu[\s\-]?alaikum|"
+    r"as[\s\-]?salamu[\s\-]?alaykum|good\s+(morning|afternoon|evening))\b",
+    re.IGNORECASE,
+)
 
 INDEX = None
 CHUNKS = None
@@ -704,6 +723,204 @@ def generate_answer(question: str, chunks: list) -> tuple:
         )
 
 
+def run_chat(message: str, *, channel: str = "api") -> "ChatResponse":
+    """Shared RAG pipeline used by the web /chat endpoint and WhatsApp."""
+    text = (message or "").strip()
+    if not text:
+        return ChatResponse(
+            answer="Please send a question about the medical documents.",
+            sources=[],
+            confidence=0.0,
+        )
+
+    if channel == "whatsapp" and _WA_GREETING.match(text):
+        return ChatResponse(
+            answer=(
+                "Hi, I'm MedChat. Send a question and I'll answer from the "
+                "medical documents."
+            ),
+            sources=[],
+            confidence=1.0,
+        )
+
+    chunks = retrieve_chunks(text)
+    confidence = sum(c["score"] for c in chunks) / len(chunks) if chunks else 0.0
+    if not chunks:
+        n = count_ready_chunks()
+        docs = count_ready_documents()
+        if channel == "whatsapp":
+            if n is None:
+                answer = "The knowledge base is not connected yet. Please try again later."
+            elif (docs or 0) == 0 or n == 0:
+                answer = "I don't have any documents loaded yet. Please try again later."
+            else:
+                answer = (
+                    "I couldn't find relevant passages for that question. "
+                    "Try rephrasing it."
+                )
+        elif n is None:
+            answer = (
+                "The knowledge base is not connected. Set SUPABASE_URL and "
+                "SUPABASE_SERVICE_ROLE_KEY on the API service, then try again."
+            )
+        elif (docs or 0) == 0 or n == 0:
+            answer = (
+                "The knowledge base is empty. Add PDFs to backend/data and run "
+                "POST /ingest (or: python main.py --ingest)."
+            )
+        else:
+            answer = (
+                "I couldn't find relevant passages for that question. "
+                "Try rephrasing, or re-ingest with: python main.py --ingest --force"
+            )
+        return ChatResponse(answer=answer, sources=[], confidence=0.0)
+
+    answer, sources = generate_answer(text, chunks)
+    return ChatResponse(answer=answer, sources=sources, confidence=confidence)
+
+
+# ──────────────────────────────────────────────
+# WhatsApp Cloud API
+# ──────────────────────────────────────────────
+def whatsapp_configured() -> bool:
+    return bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID)
+
+
+def _already_processed_wa(msg_id: str) -> bool:
+    if not msg_id:
+        return False
+    if msg_id in _PROCESSED_WA_IDS:
+        return True
+    _PROCESSED_WA_IDS.add(msg_id)
+    while len(_PROCESSED_WA_IDS) > _PROCESSED_WA_MAX:
+        _PROCESSED_WA_IDS.pop()
+    return False
+
+
+def _valid_whatsapp_signature(raw_body: bytes, header: str) -> bool:
+    if not WHATSAPP_APP_SECRET:
+        return True
+    if not header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        WHATSAPP_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(header[7:], expected)
+
+
+def format_whatsapp_reply(result: "ChatResponse") -> str:
+    parts = [result.answer.strip()]
+    if result.sources:
+        lines = []
+        seen = set()
+        for src in result.sources:
+            title = (src.get("title") or src.get("source") or "Document").strip()
+            page = src.get("page")
+            label = f"{title} p.{page}" if page else title
+            if label in seen:
+                continue
+            seen.add(label)
+            lines.append(f"• {label}")
+        if lines:
+            parts.append("Sources:\n" + "\n".join(lines[:5]))
+    return "\n\n".join(p for p in parts if p)
+
+
+def _split_whatsapp_text(text: str) -> list:
+    if len(text) <= WHATSAPP_MAX_CHARS:
+        return [text] if text else []
+    parts = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= WHATSAPP_MAX_CHARS:
+            parts.append(remaining)
+            break
+        window = remaining[:WHATSAPP_MAX_CHARS]
+        cut = window.rfind("\n")
+        if cut < WHATSAPP_MAX_CHARS // 2:
+            cut = window.rfind(" ")
+        if cut < WHATSAPP_MAX_CHARS // 2:
+            cut = WHATSAPP_MAX_CHARS
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    return [p for p in parts if p]
+
+
+def send_whatsapp_text(to: str, body: str) -> None:
+    if not whatsapp_configured():
+        print("⚠️ WhatsApp reply skipped: set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID")
+        return
+
+    url = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
+    payload = json.dumps({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"preview_url": False, "body": body},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        print(f"⚠️ WhatsApp send failed ({e.code}): {detail}")
+    except Exception as e:
+        print(f"⚠️ WhatsApp send failed: {e}")
+
+
+def handle_whatsapp_payload(payload: dict) -> None:
+    if payload.get("object") != "whatsapp_business_account":
+        return
+
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            for msg in value.get("messages") or []:
+                msg_id = msg.get("id") or ""
+                if _already_processed_wa(msg_id):
+                    continue
+
+                sender = msg.get("from")
+                if not sender:
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type != "text":
+                    send_whatsapp_text(
+                        sender,
+                        "Please send a text question and I'll answer from the medical documents.",
+                    )
+                    continue
+
+                question = ((msg.get("text") or {}).get("body") or "").strip()
+                if not question:
+                    continue
+
+                try:
+                    result = run_chat(question, channel="whatsapp")
+                    reply = format_whatsapp_reply(result)
+                except Exception as e:
+                    print(f"⚠️ WhatsApp chat failed: {e}")
+                    reply = "I encountered an error while generating the response. Please try again."
+
+                for chunk in _split_whatsapp_text(reply):
+                    send_whatsapp_text(sender, chunk)
+
+
 # ──────────────────────────────────────────────
 # ENDPOINTS
 # ──────────────────────────────────────────────
@@ -730,6 +947,7 @@ async def health():
         "embedding_model": EMBEDDING_MODEL_NAME,
         "pdf_files": [os.path.basename(p) for p in list_pdf_files()],
         "groq_model": GROQ_MODEL,
+        "whatsapp_configured": whatsapp_configured() and bool(WHATSAPP_VERIFY_TOKEN),
     }
 
 
@@ -761,30 +979,41 @@ async def ingest(force: bool = False):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    chunks = retrieve_chunks(req.message)
-    confidence = sum(c["score"] for c in chunks) / len(chunks) if chunks else 0.0
-    if not chunks:
-        n = count_ready_chunks()
-        docs = count_ready_documents()
-        if n is None:
-            answer = (
-                "The knowledge base is not connected. Set SUPABASE_URL and "
-                "SUPABASE_SERVICE_ROLE_KEY on the API service, then try again."
-            )
-        elif (docs or 0) == 0 or n == 0:
-            answer = (
-                "The knowledge base is empty. Add PDFs to backend/data and run "
-                "POST /ingest (or: python main.py --ingest)."
-            )
-        else:
-            answer = (
-                "I couldn't find relevant passages for that question. "
-                "Try rephrasing, or re-ingest with: python main.py --ingest --force"
-            )
-        return ChatResponse(answer=answer, sources=[], confidence=0.0)
+    return run_chat(req.message, channel="api")
 
-    answer, sources = generate_answer(req.message, chunks)
-    return ChatResponse(answer=answer, sources=sources, confidence=confidence)
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_verify(
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
+):
+    """Meta webhook verification handshake."""
+    if (
+        hub_mode == "subscribe"
+        and WHATSAPP_VERIFY_TOKEN
+        and hub_verify_token == WHATSAPP_VERIFY_TOKEN
+    ):
+        return PlainTextResponse(hub_challenge or "")
+    raise HTTPException(status_code=403, detail="WhatsApp webhook verification failed")
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_incoming(request: Request, background_tasks: BackgroundTasks):
+    """Inbound WhatsApp messages → same RAG chatbot as POST /chat."""
+    raw = await request.body()
+    if WHATSAPP_APP_SECRET and not _valid_whatsapp_signature(
+        raw, request.headers.get("X-Hub-Signature-256", "")
+    ):
+        raise HTTPException(status_code=403, detail="Invalid WhatsApp signature")
+
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        return {"status": "ignored"}
+
+    background_tasks.add_task(handle_whatsapp_payload, payload)
+    return {"status": "ok"}
 
 
 @app.post("/feedback")
