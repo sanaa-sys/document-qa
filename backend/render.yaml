@@ -2,7 +2,7 @@ services:
   - type: web
     name: document-qa-api
     runtime: python
-    # In Render dashboard: Root Directory = backend
+    # In Render dashboard: Root Directory =  backend
     rootDir: backend
     plan: starter
     buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
