@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import posthog from 'posthog-js'
 import { ArrowUp, BookText, Loader2 } from 'lucide-react'
+import { AssistantAnswer } from '@/components/assistant-answer'
 import { Button } from '@/components/ui/button'
 import { OneThirdMark } from '@/components/one-third-mark'
 import { stripThinkTags } from '@/lib/strip-think'
@@ -16,6 +17,7 @@ type Message = {
     content: string
     sources?: Source[]
     error?: boolean
+    pending?: boolean
 }
 
 const suggestions = [
@@ -30,6 +32,43 @@ function sourceLabel(s: Source): string {
     return s.page != null ? `${base} · p.${s.page}` : base
 }
 
+type StreamEvent = {
+    type?: string
+    content?: string
+    error?: string
+    sources?: Source[]
+    message?: string
+}
+
+async function readSse(
+    res: Response,
+    onEvent: (event: StreamEvent) => void,
+) {
+    const reader = res.body?.getReader()
+    if (!reader) return
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() ?? ''
+        for (const part of parts) {
+            const dataLine = part
+                .split('\n')
+                .find((line) => line.startsWith('data: '))
+            if (!dataLine) continue
+            try {
+                onEvent(JSON.parse(dataLine.slice(6)) as StreamEvent)
+            } catch {
+                // ignore malformed chunks
+            }
+        }
+    }
+}
+
 export function ChatInterface() {
     const [messages, setMessages] = useState<Message[]>([])
     const [input, setInput] = useState('')
@@ -41,6 +80,15 @@ export function ChatInterface() {
         scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
     }, [messages, loading])
 
+    function patchAssistant(id: string, patch: Partial<Message> | ((prev: Message) => Message)) {
+        setMessages((prev) =>
+            prev.map((m) => {
+                if (m.id !== id) return m
+                return typeof patch === 'function' ? patch(m) : { ...m, ...patch }
+            }),
+        )
+    }
+
     async function send(text: string) {
         const trimmed = text.trim()
         if (!trimmed || loading) return
@@ -50,12 +98,15 @@ export function ChatInterface() {
             role: 'user',
             content: trimmed,
         }
-        const history = [...messages, userMessage].map((m) => ({
-            role: m.role,
-            content: m.content,
-        }))
+        const assistantId = crypto.randomUUID()
+        const assistantMessage: Message = {
+            id: assistantId,
+            role: 'assistant',
+            content: '',
+            pending: true,
+        }
 
-        setMessages((prev) => [...prev, userMessage])
+        setMessages((prev) => [...prev, userMessage, assistantMessage])
         setInput('')
         setLoading(true)
 
@@ -63,8 +114,61 @@ export function ChatInterface() {
             const res = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: trimmed, history }),
+                body: JSON.stringify({ message: trimmed }),
             })
+            const contentType = res.headers.get('content-type') || ''
+
+            if (contentType.includes('text/event-stream') && res.body) {
+                let streamed = ''
+                let sources: Source[] = []
+                let streamError: string | null = null
+
+                await readSse(res, (event) => {
+                    if (event.type === 'token' && event.content) {
+                        streamed += event.content
+                        const visible = stripThinkTags(streamed) || streamed
+                        patchAssistant(assistantId, {
+                            content: visible,
+                            pending: false,
+                        })
+                    } else if (event.type === 'meta' && Array.isArray(event.sources)) {
+                        sources = event.sources
+                        patchAssistant(assistantId, { sources })
+                    } else if (event.type === 'error') {
+                        streamError = event.error || 'Something went wrong. Please try again.'
+                    } else if (event.type === 'done' && Array.isArray(event.sources)) {
+                        sources = event.sources
+                    }
+                })
+
+                if (streamError) {
+                    posthog.capture('chat_message_failed', {
+                        status: res.status,
+                        message_length: trimmed.length,
+                    })
+                    patchAssistant(assistantId, {
+                        content: streamError,
+                        error: true,
+                        pending: false,
+                    })
+                    return
+                }
+
+                const answer = stripThinkTags(streamed)
+                posthog.capture('chat_message_sent', {
+                    message_length: trimmed.length,
+                    has_sources: sources.length > 0,
+                    source_count: sources.length,
+                    streamed: true,
+                })
+                patchAssistant(assistantId, {
+                    content: answer || 'I could not find an answer for that.',
+                    sources,
+                    pending: false,
+                })
+                return
+            }
+
             const data = await res.json()
 
             if (!res.ok) {
@@ -72,47 +176,35 @@ export function ChatInterface() {
                     status: res.status,
                     message_length: trimmed.length,
                 })
-                setMessages((prev) => [
-                    ...prev,
-                    {
-                        id: crypto.randomUUID(),
-                        role: 'assistant',
-                        content: data?.error ?? 'Something went wrong. Please try again.',
-                        error: true,
-                    },
-                ])
+                patchAssistant(assistantId, {
+                    content: data?.error ?? 'Something went wrong. Please try again.',
+                    error: true,
+                    pending: false,
+                })
             } else {
                 posthog.capture('chat_message_sent', {
                     message_length: trimmed.length,
                     has_sources: Array.isArray(data.sources) && data.sources.length > 0,
                     source_count: Array.isArray(data.sources) ? data.sources.length : 0,
                 })
-                setMessages((prev) => [
-                    ...prev,
-                    {
-                        id: crypto.randomUUID(),
-                        role: 'assistant',
-                        content:
-                            stripThinkTags(data.answer || '') ||
-                            'I could not find an answer for that.',
-                        sources: Array.isArray(data.sources) ? data.sources : [],
-                    },
-                ])
+                patchAssistant(assistantId, {
+                    content:
+                        stripThinkTags(data.answer || '') ||
+                        'I could not find an answer for that.',
+                    sources: Array.isArray(data.sources) ? data.sources : [],
+                    pending: false,
+                })
             }
         } catch {
             posthog.capture('chat_message_failed', {
                 status: 0,
                 message_length: trimmed.length,
             })
-            setMessages((prev) => [
-                ...prev,
-                {
-                    id: crypto.randomUUID(),
-                    role: 'assistant',
-                    content: 'Could not reach the chatbot. Please try again shortly.',
-                    error: true,
-                },
-            ])
+            patchAssistant(assistantId, {
+                content: 'Could not reach the chatbot. Please try again shortly.',
+                error: true,
+                pending: false,
+            })
         } finally {
             setLoading(false)
         }
@@ -179,7 +271,16 @@ export function ChatInterface() {
                                                 : 'bg-muted text-foreground',
                                     )}
                                 >
-                                    <p className="whitespace-pre-wrap text-pretty">{m.content}</p>
+                                    {m.role === 'assistant' && m.pending && !m.content ? (
+                                        <div className="flex items-center gap-2 text-muted-foreground">
+                                            <Loader2 className="size-4 animate-spin" />
+                                            <span className="text-sm">Searching documents…</span>
+                                        </div>
+                                    ) : m.role === 'assistant' && !m.error ? (
+                                        <AssistantAnswer content={m.content} />
+                                    ) : (
+                                        <p className="whitespace-pre-wrap text-pretty">{m.content}</p>
+                                    )}
                                     {m.sources && m.sources.length > 0 && (
                                         <div className="mt-3 flex flex-col gap-1.5 border-t border-border/60 pt-3">
                                             <span className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
@@ -201,14 +302,6 @@ export function ChatInterface() {
                                 </div>
                             </li>
                         ))}
-                        {loading && (
-                            <li className="flex justify-start">
-                                <div className="flex items-center gap-2 rounded-2xl bg-muted px-4 py-3 text-muted-foreground">
-                                    <Loader2 className="size-4 animate-spin" />
-                                    <span className="text-sm">One Third is thinking…</span>
-                                </div>
-                            </li>
-                        )}
                     </ul>
                 )}
             </div>

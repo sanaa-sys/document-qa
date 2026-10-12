@@ -1,10 +1,12 @@
+import asyncio
 import hashlib
 import hmac
+import threading
 import urllib.error
 import urllib.request
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from groq import Groq
@@ -47,6 +49,7 @@ app.add_middleware(
 # ──────────────────────────────────────────────
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 TEMPERATURE = 0.1
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "768"))
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback_log.json")
 EMBEDDING_MODEL_NAME = os.getenv(
@@ -135,6 +138,14 @@ def ensure_model():
             "No embedding backend installed. From the backend folder run: "
             "pip install fastembed"
         ) from e
+
+
+def _warm_embeddings():
+    try:
+        ensure_model()
+        print("✅ Embeddings warmed in background")
+    except Exception as e:
+        print(f"⚠️ Embedding warmup failed: {e}")
 
 
 def embed_texts(texts: list) -> list:
@@ -333,6 +344,18 @@ async def load_rag():
             print(f"⚠️ Embedding model load failed: {e}")
     else:
         print("ℹ️ Embeddings will load lazily on first /chat (saves RAM at boot)")
+
+    # Warm embeddings in the background so the first user question is not
+    # blocked by model download/load (does not delay Railway health checks).
+    disable_warmup = os.getenv("DISABLE_EMBEDDING_WARMUP", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if MODEL is None and not disable_warmup:
+        threading.Thread(
+            target=_warm_embeddings,
+            daemon=True,
+            name="embed-warmup",
+        ).start()
 
     if os.getenv("INGEST_ON_STARTUP", "").strip().lower() in ("1", "true", "yes"):
         try:
@@ -623,105 +646,202 @@ def strip_think_tags(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
 
+SYSTEM_INSTRUCTION = (
+    "You are ONE-THIRD, a medical knowledge assistant. Answer ONLY from the "
+    "provided context. Never invent remedies, doses, or drug names.\n\n"
+    "TREATMENT / SELF-CARE QUESTIONS (symptoms, conditions, how to treat, "
+    "relieve, or manage something):\n"
+    "Write the entire answer under these three Markdown headings, in this order:\n"
+    "## Effective Home Remedies\n"
+    "## Over-the-Counter Medications\n"
+    "## What Not to Do\n\n"
+    "Under each heading use short bullet points. Cite a page when a fact comes "
+    "from the context, e.g. (p. 49). If the context has nothing for a heading, "
+    "write one bullet: Not mentioned in the available documents.\n\n"
+    "OTHER QUESTIONS (benefits, explanations, what is X):\n"
+    "Answer in short bullets or a brief paragraph. Do not force those three headings.\n\n"
+    "If the context is insufficient, say so plainly. Never include <think> tags "
+    "or chain-of-thought."
+)
+
+
+def _format_context(chunks: list) -> str:
+    parts = [
+        f"[{c.get('title') or c.get('source') or 'Document'} · p.{c['page']}]: {c['text']}"
+        for c in chunks[:5]
+    ]
+    return "\n\n---\n\n".join(parts)
+
+
+def _sources_from_chunks(chunks: list) -> list:
+    return [
+        {
+            "page": c["page"],
+            "source": os.path.basename(str(c.get("source") or "Document")),
+            "title": c.get("title") or c.get("source") or "Document",
+            "document_id": c.get("document_id"),
+            "score": round(float(c.get("score") or 0), 3),
+        }
+        for c in chunks[:5]
+    ]
+
+
+def _build_messages(question: str, context: str) -> list:
+    user_prompt = (
+        f"CONTEXT FROM MEDICAL DOCUMENTS:\n{'=' * 50}\n{context}\n{'=' * 50}\n\n"
+        f"QUESTION: {question}\n\n"
+        "Answer following the guidelines. Reply with the answer only."
+    )
+    return [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _groq_kwargs(messages: list, stream: bool = False) -> dict:
+    kwargs = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        "stream": stream,
+    }
+    # Disable Qwen thinking. Do not set reasoning_format="hidden" — that still
+    # spends time on a hidden chain-of-thought before the first visible token.
+    if "qwen" in GROQ_MODEL.lower():
+        kwargs["reasoning_effort"] = "none"
+    return kwargs
+
+
+def _create_completion(client: Groq, kwargs: dict):
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        print(f"⚠️ Groq create failed ({e}); retrying with compatibility params")
+        fallback = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("reasoning_effort", "reasoning_format", "include_reasoning")
+        }
+        if "max_completion_tokens" in fallback:
+            fallback["max_tokens"] = fallback.pop("max_completion_tokens")
+        return client.chat.completions.create(**fallback)
+
+
+class _IncrementalThinkStrip:
+    """Yield only the visible (non-<think>) suffix as tokens arrive."""
+
+    def __init__(self):
+        self.raw = ""
+        self.shown = ""
+
+    def push(self, piece: str) -> str:
+        if not piece:
+            return ""
+        self.raw += piece
+        cleaned = strip_think_tags(self.raw)
+        if cleaned.startswith(self.shown):
+            delta = cleaned[len(self.shown):]
+            self.shown = cleaned
+            return delta
+        self.shown = cleaned
+        return ""
+
+
 def generate_answer(question: str, chunks: list) -> tuple:
     """Generate answer using retrieved context with improved response quality."""
-    
     if not chunks:
-        return "I don't have sufficient information in the medical documents to answer that question.", []
-    
+        return (
+            "I don't have sufficient information in the medical documents to answer that question.",
+            [],
+        )
+
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
         context = "\n\n".join([c["text"] for c in chunks[:5]])
         return (
             "I couldn't connect to the AI service due to a configuration issue. "
             "However, here's the relevant information from the documents:\n\n"
-            f"{context}", 
-            []
+            f"{context}",
+            [],
         )
-    
+
     try:
         client = Groq(api_key=api_key)
-        
-        # Format context with clear separators and page references
-        context_parts = [
-            f"[{c.get('title') or c.get('source') or 'Document'} · p.{c['page']}]: {c['text']}"
-            for c in chunks[:5]
-        ]
-        context = "\n\n---\n\n".join(context_parts)
-        
-        # Improved system prompt for better response quality
-        system_instruction = (
-            "You are a medical knowledge assistant providing accurate, well-formatted responses. "
-            "Follow these guidelines strictly:\n\n"
-            "1. Answer ONLY using the provided context from medical documents.\n"
-            "2. If the information isn't in the context, state clearly: 'I don't have sufficient "
-            "information in the medical documents to answer that question.'\n"
-            "3. Write in clear, professional language with complete sentences.\n"
-            "4. Use bullet points or numbered lists when presenting multiple pieces of information.\n"
-            "5. Cite page numbers when referencing specific information (e.g., 'According to page 49...').\n"
-            "6. Avoid speculation, generalizations, or adding information outside the context.\n"
-            "7. If context is contradictory, acknowledge the discrepancy.\n\n"
-            "Format your response with:\n"
-            "- A direct answer to the question in the first paragraph\n"
-            "- Supporting details organized logically\n"
-            "- Clear attribution to source pages\n\n"
-            "Never include <think> tags, chain-of-thought, or internal reasoning in the reply."
-        )
-        
-        user_prompt = (
-            f"CONTEXT FROM MEDICAL DOCUMENTS:\n{'='*50}\n{context}\n{'='*50}\n\n"
-            f"QUESTION: {question}\n\n"
-            "Provide a well-structured, professional answer following all guidelines above."
-        )
-        
-        create_kwargs = {
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": TEMPERATURE,
-            "max_tokens": 1024,
-            "stream": False,
-        }
-        # Qwen reasoning models otherwise dump <think> into the user-visible answer.
-        if "qwen" in GROQ_MODEL.lower():
-            create_kwargs["reasoning_format"] = "hidden"
-            create_kwargs["reasoning_effort"] = "none"
-
-        try:
-            response = client.chat.completions.create(**create_kwargs)
-        except Exception:
-            create_kwargs.pop("reasoning_format", None)
-            create_kwargs.pop("reasoning_effort", None)
-            response = client.chat.completions.create(**create_kwargs)
-        
+        context = _format_context(chunks)
+        messages = _build_messages(question, context)
+        response = _create_completion(client, _groq_kwargs(messages, stream=False))
         answer = strip_think_tags(response.choices[0].message.content or "")
         if not answer:
             answer = "I couldn't produce a clear answer from the documents. Please try asking again."
-        
-        # Clean sources to include only essential metadata
-        sources = [
-            {
-                "page": c["page"],
-                "source": os.path.basename(str(c.get("source") or "Document")),
-                "title": c.get("title") or c.get("source") or "Document",
-                "document_id": c.get("document_id"),
-                "score": round(float(c.get("score") or 0), 3),
-            }
-            for c in chunks[:5]
-        ]
-        
-        return answer, sources
-    
+        return answer, _sources_from_chunks(chunks)
     except Exception as e:
-        error_detail = str(e)
-        # Don't expose internal error details to users
+        print(f"⚠️ generate_answer failed: {e}")
         return (
             "I encountered an error while generating the response. "
             "Please try again with your question.",
-            []
+            [],
         )
+
+
+def iter_answer_tokens(question: str, chunks: list):
+    """Yield visible answer text as Groq tokens arrive."""
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        context = "\n\n".join([c["text"] for c in chunks[:5]])
+        yield (
+            "I couldn't connect to the AI service due to a configuration issue. "
+            "However, here's the relevant information from the documents:\n\n"
+            f"{context}"
+        )
+        return
+
+    client = Groq(api_key=api_key)
+    messages = _build_messages(question, _format_context(chunks))
+    stream = _create_completion(client, _groq_kwargs(messages, stream=True))
+    stripper = _IncrementalThinkStrip()
+    for event in stream:
+        try:
+            piece = event.choices[0].delta.content or ""
+        except (AttributeError, IndexError):
+            piece = ""
+        visible = stripper.push(piece)
+        if visible:
+            yield visible
+    if not stripper.shown:
+        yield "I couldn't produce a clear answer from the documents. Please try asking again."
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _no_chunks_answer(channel: str) -> str:
+    n = count_ready_chunks()
+    docs = count_ready_documents()
+    if channel == "whatsapp":
+        if n is None:
+            return "The knowledge base is not connected yet. Please try again later."
+        if (docs or 0) == 0 or n == 0:
+            return "I don't have any documents loaded yet. Please try again later."
+        return (
+            "I couldn't find relevant passages for that question. "
+            "Try rephrasing it."
+        )
+    if n is None:
+        return (
+            "The knowledge base is not connected. Set SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY on the API service, then try again."
+        )
+    if (docs or 0) == 0 or n == 0:
+        return (
+            "The knowledge base is empty. Add PDFs to backend/data and run "
+            "POST /ingest (or: python main.py --ingest)."
+        )
+    return (
+        "I couldn't find relevant passages for that question. "
+        "Try rephrasing, or re-ingest with: python main.py --ingest --force"
+    )
 
 
 def run_chat(message: str, *, channel: str = "api") -> "ChatResponse":
@@ -747,34 +867,7 @@ def run_chat(message: str, *, channel: str = "api") -> "ChatResponse":
     chunks = retrieve_chunks(text)
     confidence = sum(c["score"] for c in chunks) / len(chunks) if chunks else 0.0
     if not chunks:
-        n = count_ready_chunks()
-        docs = count_ready_documents()
-        if channel == "whatsapp":
-            if n is None:
-                answer = "The knowledge base is not connected yet. Please try again later."
-            elif (docs or 0) == 0 or n == 0:
-                answer = "I don't have any documents loaded yet. Please try again later."
-            else:
-                answer = (
-                    "I couldn't find relevant passages for that question. "
-                    "Try rephrasing it."
-                )
-        elif n is None:
-            answer = (
-                "The knowledge base is not connected. Set SUPABASE_URL and "
-                "SUPABASE_SERVICE_ROLE_KEY on the API service, then try again."
-            )
-        elif (docs or 0) == 0 or n == 0:
-            answer = (
-                "The knowledge base is empty. Add PDFs to backend/data and run "
-                "POST /ingest (or: python main.py --ingest)."
-            )
-        else:
-            answer = (
-                "I couldn't find relevant passages for that question. "
-                "Try rephrasing, or re-ingest with: python main.py --ingest --force"
-            )
-        return ChatResponse(answer=answer, sources=[], confidence=0.0)
+        return ChatResponse(answer=_no_chunks_answer(channel), sources=[], confidence=0.0)
 
     answer, sources = generate_answer(text, chunks)
     return ChatResponse(answer=answer, sources=sources, confidence=confidence)
@@ -812,7 +905,8 @@ def _valid_whatsapp_signature(raw_body: bytes, header: str) -> bool:
 
 
 def format_whatsapp_reply(result: "ChatResponse") -> str:
-    parts = [result.answer.strip()]
+    answer = re.sub(r"^#{1,3}\s+(.+)$", r"*\1*", (result.answer or "").strip(), flags=re.M)
+    parts = [answer]
     if result.sources:
         lines = []
         seen = set()
@@ -981,6 +1075,68 @@ async def ingest(force: bool = False):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     return run_chat(req.message, channel="api")
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """SSE stream used by the web chatbot so tokens appear immediately."""
+    text = (req.message or "").strip()
+
+    async def events():
+        yield _sse({"type": "status", "message": "searching"})
+        if not text:
+            yield _sse({
+                "type": "token",
+                "content": "Please send a question about the medical documents.",
+            })
+            yield _sse({"type": "done", "sources": [], "confidence": 0.0})
+            return
+
+        try:
+            chunks = await asyncio.to_thread(retrieve_chunks, text)
+        except Exception as e:
+            print(f"⚠️ stream retrieve failed: {e}")
+            yield _sse({
+                "type": "error",
+                "error": "I encountered an error while searching the documents.",
+            })
+            return
+
+        if not chunks:
+            yield _sse({"type": "token", "content": _no_chunks_answer("api")})
+            yield _sse({"type": "done", "sources": [], "confidence": 0.0})
+            return
+
+        confidence = sum(c["score"] for c in chunks) / len(chunks)
+        yield _sse({
+            "type": "meta",
+            "sources": _sources_from_chunks(chunks),
+            "confidence": confidence,
+        })
+
+        try:
+            for token in iter_answer_tokens(text, chunks):
+                yield _sse({"type": "token", "content": token})
+                await asyncio.sleep(0)
+        except Exception as e:
+            print(f"⚠️ stream generate failed: {e}")
+            yield _sse({
+                "type": "error",
+                "error": "I encountered an error while generating the response.",
+            })
+            return
+
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/whatsapp/webhook")
