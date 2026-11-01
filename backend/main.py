@@ -25,6 +25,7 @@ from pinecone_store import (
     insert_document,
     keyword_chunks,
     list_documents,
+    ping_store,
     replace_chunks,
     search_chunks,
     store_uri,
@@ -391,22 +392,44 @@ def ingest_one_pdf(path: str, force: bool = False) -> dict:
 
 def ingest_data_files(force: bool = False) -> dict:
     """Parse PDFs in ./data into the Pinecone documents and chunks namespaces."""
-    ensure_model()
-
     pdfs = list_pdf_files()
+    empty = {
+        "ingested_files": [],
+        "skipped_files": [],
+        "failed_files": [],
+        "errors": {},
+        "chunks_upserted": 0,
+        "documents": None,
+        "chunks": None,
+    }
+
+    try:
+        ping_store()
+    except Exception as e:
+        print(f"⚠️ Pinecone preflight failed: {e}")
+        empty["failed_files"] = [os.path.basename(p) for p in pdfs]
+        empty["error"] = str(e)
+        empty["errors"] = {name: str(e) for name in empty["failed_files"]}
+        return empty
+
+    try:
+        ensure_model()
+    except Exception as e:
+        print(f"⚠️ Embedding preflight failed: {e}")
+        empty["failed_files"] = [os.path.basename(p) for p in pdfs]
+        empty["error"] = str(e)
+        empty["errors"] = {name: str(e) for name in empty["failed_files"]}
+        return empty
+
     if not pdfs:
-        return {
-            "ingested_files": [],
-            "skipped_files": [],
-            "failed_files": [],
-            "chunks_upserted": 0,
-            "documents": count_ready_documents(),
-            "chunks": count_ready_chunks(),
-        }
+        empty["documents"] = count_ready_documents()
+        empty["chunks"] = count_ready_chunks()
+        return empty
 
     ingested = []
     skipped = []
     failed = []
+    errors = {}
     chunks_upserted = 0
 
     for path in pdfs:
@@ -416,17 +439,21 @@ def ingest_data_files(force: bool = False) -> dict:
                 skipped.append(result["filename"])
             elif result["status"] == "failed":
                 failed.append(result["filename"])
+                if result.get("reason"):
+                    errors[result["filename"]] = result["reason"]
             else:
                 ingested.append(result["filename"])
                 chunks_upserted += result.get("chunks_upserted", 0)
         except Exception as e:
             failed.append(os.path.basename(path))
+            errors[os.path.basename(path)] = str(e)
             print(f"⚠️ Ingest failed for {path}: {e}")
 
     return {
         "ingested_files": ingested,
         "skipped_files": skipped,
         "failed_files": failed,
+        "errors": errors,
         "chunks_upserted": chunks_upserted,
         "documents": count_ready_documents(),
         "chunks": count_ready_chunks(),

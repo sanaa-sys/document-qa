@@ -46,6 +46,52 @@ def _api_key() -> str:
     return (os.getenv("PINECONE_API_KEY") or "").strip().strip("'\"")
 
 
+def _index_names(pc) -> list:
+    listed = pc.list_indexes()
+    if hasattr(listed, "names"):
+        try:
+            names = list(listed.names())
+            if names:
+                return names
+        except TypeError:
+            pass
+    items = listed if isinstance(listed, list) else getattr(listed, "indexes", None) or []
+    names = []
+    for item in items:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict) and item.get("name"):
+            names.append(item["name"])
+        elif getattr(item, "name", None):
+            names.append(item.name)
+    return names
+
+
+def _index_field(desc, *keys, default=None):
+    current = desc
+    for key in keys:
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return default if current is None else current
+
+
+def _connect_index(pc, name: str):
+    desc = pc.describe_index(name)
+    host = _index_field(desc, "host")
+    dimension = int(_index_field(desc, "dimension", default=0) or 0)
+    if dimension and dimension != EMBEDDING_DIM:
+        raise RuntimeError(
+            f"Pinecone index '{name}' is {dimension}-dimensional, but embeddings "
+            f"are {EMBEDDING_DIM}-d. Create a cosine index with dimension {EMBEDDING_DIM} "
+            f"or set PINECONE_INDEX to that index."
+        )
+    return pc.Index(host=host) if host else pc.Index(name)
+
+
 def _index():
     global _INDEX
     if _INDEX is not None:
@@ -53,7 +99,10 @@ def _index():
 
     api_key = _api_key()
     if not api_key:
-        raise RuntimeError("Pinecone is not configured. Set PINECONE_API_KEY.")
+        raise RuntimeError(
+            "Pinecone is not configured. Set PINECONE_API_KEY in backend/.env "
+            "(local) or the Render environment variables."
+        )
 
     from pinecone import Pinecone, ServerlessSpec
 
@@ -65,41 +114,47 @@ def _index():
         _INDEX = pc.Index(host=host)
         return _INDEX
 
-    listed = pc.list_indexes()
-    if hasattr(listed, "names"):
-        try:
-            existing = list(listed.names())
-        except TypeError:
-            existing = []
-    else:
-        existing = []
-        items = listed if isinstance(listed, list) else getattr(listed, "indexes", None) or []
-        for item in items:
-            if isinstance(item, str):
-                existing.append(item)
-            elif isinstance(item, dict) and item.get("name"):
-                existing.append(item["name"])
-            elif getattr(item, "name", None):
-                existing.append(item.name)
-
+    existing = _index_names(pc)
     if name not in existing:
         cloud = (os.getenv("PINECONE_CLOUD") or "aws").strip()
         region = (os.getenv("PINECONE_REGION") or "us-east-1").strip()
-        pc.create_index(
-            name=name,
-            dimension=EMBEDDING_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud=cloud, region=region),
-        )
+        try:
+            pc.create_index(
+                name=name,
+                dimension=EMBEDDING_DIM,
+                metric="cosine",
+                spec=ServerlessSpec(cloud=cloud, region=region),
+            )
+        except Exception as e:
+            hint = f" Existing indexes: {existing}." if existing else ""
+            raise RuntimeError(
+                f"Could not create Pinecone index '{name}': {e}.{hint} "
+                "On the free plan you usually get one index. Set PINECONE_INDEX "
+                f"to an existing cosine {EMBEDDING_DIM}-d index."
+            ) from e
         for _ in range(60):
             desc = pc.describe_index(name)
-            ready = desc["status"]["ready"] if isinstance(desc, dict) else desc.status.ready
-            if ready:
+            if _index_field(desc, "status", "ready"):
                 break
             time.sleep(1)
 
-    _INDEX = pc.Index(name)
+    _INDEX = _connect_index(pc, name)
     return _INDEX
+
+
+def ping_store() -> dict:
+    """Open the index once so ingest can fail with a single clear error."""
+    index = _index()
+    stats = index.describe_index_stats()
+    namespaces = {}
+    if isinstance(stats, dict):
+        namespaces = stats.get("namespaces") or {}
+    else:
+        namespaces = getattr(stats, "namespaces", None) or {}
+    return {
+        "index": store_uri(),
+        "namespaces": list(namespaces.keys()) if hasattr(namespaces, "keys") else [],
+    }
 
 
 def _vectors_from_fetch(result) -> dict:
@@ -184,14 +239,20 @@ def list_documents() -> list:
 
 
 def get_document_by_filename(filename: str) -> Optional[dict]:
-    res = _index().query(
-        namespace=DOCS_NS,
-        vector=_DOC_VECTOR,
-        top_k=20,
-        filter={"filename": {"$eq": filename}},
-        include_metadata=True,
-    )
-    matches = getattr(res, "matches", None) or res.get("matches") or []
+    try:
+        res = _index().query(
+            namespace=DOCS_NS,
+            vector=_DOC_VECTOR,
+            top_k=20,
+            filter={"filename": {"$eq": filename}},
+            include_metadata=True,
+        )
+        matches = getattr(res, "matches", None) or res.get("matches") or []
+    except Exception:
+        matches = []
+        for vector_id, meta in _fetch_all(DOCS_NS):
+            if meta.get("filename") == filename:
+                return _public_document(vector_id, meta)
     if not matches:
         return None
     match = matches[0]
