@@ -7,13 +7,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-EMBEDDING_DIM = 384
+DEFAULT_EMBED_DIM = 1024
 DOCS_NS = "documents"
 CHUNKS_NS = "chunks"
-_DOC_VECTOR = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
 _UPSERT_BATCH = 100
+_EMBED_BATCH = 32
 
+_PC = None
 _INDEX = None
+_INDEX_DIM = None
 
 _DOC_FIELDS = (
     "id",
@@ -35,7 +37,35 @@ class DocumentNotFound(Exception):
 
 
 def store_uri() -> str:
-    return (os.getenv("PINECONE_INDEX") or "document-qa").strip().strip("'\"")
+    return (os.getenv("PINECONE_INDEX") or "one-third").strip().strip("'\"")
+
+
+def embed_model_name() -> str:
+    return (os.getenv("PINECONE_EMBED_MODEL") or "llama-text-embed-v2").strip() or "llama-text-embed-v2"
+
+
+def embedding_dim() -> int:
+    if _INDEX_DIM:
+        return int(_INDEX_DIM)
+    raw = (os.getenv("PINECONE_DIMENSION") or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return DEFAULT_EMBED_DIM
+
+
+def _doc_vector() -> list:
+    dim = embedding_dim()
+    return [1.0] + [0.0] * (dim - 1)
+
+
+def _set_index_dim(dimension) -> None:
+    global _INDEX_DIM
+    try:
+        dim = int(dimension or 0)
+    except (TypeError, ValueError):
+        dim = 0
+    if dim > 0:
+        _INDEX_DIM = dim
 
 
 def _now() -> str:
@@ -79,23 +109,10 @@ def _index_field(desc, *keys, default=None):
     return default if current is None else current
 
 
-def _connect_index(pc, name: str):
-    desc = pc.describe_index(name)
-    host = _index_field(desc, "host")
-    dimension = int(_index_field(desc, "dimension", default=0) or 0)
-    if dimension and dimension != EMBEDDING_DIM:
-        raise RuntimeError(
-            f"Pinecone index '{name}' is {dimension}-dimensional, but embeddings "
-            f"are {EMBEDDING_DIM}-d. Create a cosine index with dimension {EMBEDDING_DIM} "
-            f"or set PINECONE_INDEX to that index."
-        )
-    return pc.Index(host=host) if host else pc.Index(name)
-
-
-def _index():
-    global _INDEX
-    if _INDEX is not None:
-        return _INDEX
+def _client():
+    global _PC
+    if _PC is not None:
+        return _PC
 
     api_key = _api_key()
     if not api_key:
@@ -104,24 +121,48 @@ def _index():
             "(local) or the Render environment variables."
         )
 
-    from pinecone import Pinecone, ServerlessSpec
+    from pinecone import Pinecone
 
-    pc = Pinecone(api_key=api_key)
+    _PC = Pinecone(api_key=api_key)
+    return _PC
+
+
+def _connect_index(pc, name: str):
+    desc = pc.describe_index(name)
+    host = _index_field(desc, "host")
+    _set_index_dim(_index_field(desc, "dimension"))
+    return pc.Index(host=host) if host else pc.Index(name)
+
+
+def _index():
+    global _INDEX
+    if _INDEX is not None:
+        return _INDEX
+
+    pc = _client()
     host = (os.getenv("PINECONE_HOST") or "").strip().strip("'\"")
     name = store_uri()
 
     if host:
         _INDEX = pc.Index(host=host)
+        try:
+            stats = _INDEX.describe_index_stats()
+            _set_index_dim(getattr(stats, "dimension", None) or (stats.get("dimension") if isinstance(stats, dict) else None))
+        except Exception:
+            pass
         return _INDEX
 
     existing = _index_names(pc)
     if name not in existing:
+        from pinecone import ServerlessSpec
+
         cloud = (os.getenv("PINECONE_CLOUD") or "aws").strip()
         region = (os.getenv("PINECONE_REGION") or "us-east-1").strip()
+        dim = embedding_dim()
         try:
             pc.create_index(
                 name=name,
-                dimension=EMBEDDING_DIM,
+                dimension=dim,
                 metric="cosine",
                 spec=ServerlessSpec(cloud=cloud, region=region),
             )
@@ -130,7 +171,7 @@ def _index():
             raise RuntimeError(
                 f"Could not create Pinecone index '{name}': {e}.{hint} "
                 "On the free plan you usually get one index. Set PINECONE_INDEX "
-                f"to an existing cosine {EMBEDDING_DIM}-d index."
+                "to your existing index (this project uses one-third)."
             ) from e
         for _ in range(60):
             desc = pc.describe_index(name)
@@ -140,6 +181,38 @@ def _index():
 
     _INDEX = _connect_index(pc, name)
     return _INDEX
+
+
+def embed_texts(texts: list, input_type: str = "passage") -> list:
+    """Embed with Pinecone Inference so vectors match the index dimension."""
+    if not texts:
+        return []
+    _index()
+    pc = _client()
+    dim = embedding_dim()
+    model = embed_model_name()
+    vectors = []
+    for start in range(0, len(texts), _EMBED_BATCH):
+        batch = [text if text.strip() else " " for text in texts[start:start + _EMBED_BATCH]]
+        params = {"input_type": input_type, "truncate": "END"}
+        if model.startswith("llama-text-embed"):
+            params["dimension"] = dim
+        try:
+            result = pc.inference.embed(model=model, inputs=batch, parameters=params)
+        except Exception:
+            params.pop("dimension", None)
+            result = pc.inference.embed(model=model, inputs=batch, parameters=params)
+        rows = getattr(result, "data", None) or result
+        for item in rows:
+            values = getattr(item, "values", None)
+            if values is None and isinstance(item, dict):
+                values = item.get("values")
+            if not values:
+                raise RuntimeError("Pinecone inference returned an empty embedding.")
+            vectors.append([float(x) for x in values])
+    if vectors and _INDEX_DIM is None:
+        _set_index_dim(len(vectors[0]))
+    return vectors
 
 
 def ping_store() -> dict:
@@ -153,6 +226,8 @@ def ping_store() -> dict:
         namespaces = getattr(stats, "namespaces", None) or {}
     return {
         "index": store_uri(),
+        "dimension": embedding_dim(),
+        "embed_model": embed_model_name(),
         "namespaces": list(namespaces.keys()) if hasattr(namespaces, "keys") else [],
     }
 
@@ -242,7 +317,7 @@ def get_document_by_filename(filename: str) -> Optional[dict]:
     try:
         res = _index().query(
             namespace=DOCS_NS,
-            vector=_DOC_VECTOR,
+            vector=_doc_vector(),
             top_k=20,
             filter={"filename": {"$eq": filename}},
             include_metadata=True,
@@ -276,7 +351,7 @@ def insert_document(fields: dict) -> str:
         "updated_at": now,
     }
     _index().upsert(
-        vectors=[{"id": document_id, "values": _DOC_VECTOR, "metadata": meta}],
+        vectors=[{"id": document_id, "values": _doc_vector(), "metadata": meta}],
         namespace=DOCS_NS,
     )
     return document_id
@@ -318,7 +393,7 @@ def update_document(document_id: str, fields: dict) -> None:
     meta["created_at"] = current.get("created_at") or _now()
 
     _index().upsert(
-        vectors=[{"id": document_id, "values": _DOC_VECTOR, "metadata": meta}],
+        vectors=[{"id": document_id, "values": _doc_vector(), "metadata": meta}],
         namespace=DOCS_NS,
     )
 
@@ -349,8 +424,8 @@ def replace_chunks(
     payload = []
     for row in rows:
         vector = [float(x) for x in row["vector"]]
-        if len(vector) != EMBEDDING_DIM:
-            raise ValueError(f"Expected embedding dim {EMBEDDING_DIM}, got {len(vector)}")
+        if len(vector) != embedding_dim():
+            raise ValueError(f"Expected embedding dim {embedding_dim()}, got {len(vector)}")
         payload.append({
             "id": str(uuid.uuid4()),
             "values": vector,
@@ -378,8 +453,8 @@ def replace_chunks(
 
 
 def search_chunks(vector: list, top_k: int, threshold: float) -> list:
-    if len(vector) != EMBEDDING_DIM:
-        print(f"⚠️ Unexpected embedding dim {len(vector)} (expected {EMBEDDING_DIM})")
+    if len(vector) != embedding_dim():
+        print(f"⚠️ Unexpected embedding dim {len(vector)} (expected {embedding_dim()})")
         return []
 
     try:

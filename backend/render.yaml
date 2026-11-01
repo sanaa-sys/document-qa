@@ -27,7 +27,9 @@ services:
       - key: PINECONE_API_KEY
         sync: false
       - key: PINECONE_INDEX
-        value: document-qa
+        value: one-third
+      - key: PINECONE_EMBED_MODEL
+        value: llama-text-embed-v2
       - key: PINECONE_CLOUD
         value: aws
       - key: PINECONE_REGION

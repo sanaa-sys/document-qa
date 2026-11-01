@@ -21,6 +21,9 @@ from pinecone_store import (
     count_ready_documents,
     delete_chunks,
     delete_document,
+    embed_model_name,
+    embed_texts as pinecone_embed_texts,
+    embedding_dim,
     get_document_by_filename,
     insert_document,
     keyword_chunks,
@@ -64,10 +67,7 @@ TEMPERATURE = 0.1
 MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "768"))
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback_log.json")
-EMBEDDING_MODEL_NAME = os.getenv(
-    "EMBEDDING_MODEL_NAME",
-    "sentence-transformers/all-MiniLM-L6-v2",
-)
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME") or embed_model_name()
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 200
 INGEST_BATCH_SIZE = 50
@@ -91,37 +91,19 @@ _WA_GREETING = re.compile(
 )
 
 MODEL = None
-MODEL_BACKEND = None  # "fastembed" | "sentence-transformers"
+MODEL_BACKEND = None  # "pinecone"
 
 
 def ensure_model():
-    """Lazy-load embeddings. Prefer fastembed (ONNX) so Render 512MB can boot."""
+    """Embeddings come from Pinecone Inference so they match the index dimension."""
     global MODEL, MODEL_BACKEND
-    if MODEL is not None:
+    if MODEL_BACKEND == "pinecone":
         return MODEL
-
-    try:
-        from fastembed import TextEmbedding
-
-        MODEL = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
-        MODEL_BACKEND = "fastembed"
-        print(f"✅ Embedding backend: fastembed ({EMBEDDING_MODEL_NAME})")
-        return MODEL
-    except Exception as e:
-        print(f"⚠️ fastembed unavailable ({e}); trying sentence-transformers")
-
-    try:
-        from sentence_transformers import SentenceTransformer
-
-        MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        MODEL_BACKEND = "sentence-transformers"
-        print(f"✅ Embedding backend: sentence-transformers ({EMBEDDING_MODEL_NAME})")
-        return MODEL
-    except Exception as e:
-        raise RuntimeError(
-            "No embedding backend installed. From the backend folder run: "
-            "pip install fastembed"
-        ) from e
+    ping_store()
+    MODEL = True
+    MODEL_BACKEND = "pinecone"
+    print(f"✅ Embedding backend: pinecone ({embed_model_name()}, {embedding_dim()}-d)")
+    return MODEL
 
 
 def _warm_embeddings():
@@ -132,14 +114,10 @@ def _warm_embeddings():
         print(f"⚠️ Embedding warmup failed: {e}")
 
 
-def embed_texts(texts: list) -> list:
-    """Return L2-normalized embedding vectors as plain Python float lists."""
-    model = ensure_model()
-    if MODEL_BACKEND == "fastembed":
-        return [[float(x) for x in vec] for vec in model.embed(texts)]
-
-    raw = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    return [[float(x) for x in vector] for vector in raw]
+def embed_texts(texts: list, input_type: str = "passage") -> list:
+    """Return embedding vectors that match the Pinecone index dimension."""
+    ensure_model()
+    return pinecone_embed_texts(texts, input_type=input_type)
 
 
 def file_checksum(path: str) -> str:
@@ -152,7 +130,7 @@ def file_checksum(path: str) -> str:
 
 def retrieve_chunks(question: str, top_k: int = MATCH_COUNT) -> list:
     try:
-        question_vec = embed_texts([question])[0]
+        question_vec = embed_texts([question], input_type="query")[0]
     except Exception as e:
         print(f"⚠️ Embedding failed: {e}")
         return []
@@ -871,7 +849,8 @@ async def health():
         "chunks": chunks,
         "embedding_loaded": MODEL is not None,
         "embedding_backend": MODEL_BACKEND,
-        "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_model": embed_model_name(),
+        "embedding_dim": embedding_dim(),
         "pdf_files": [os.path.basename(p) for p in list_pdf_files()],
         "groq_model": GROQ_MODEL,
         "whatsapp_configured": whatsapp_configured() and bool(WHATSAPP_VERIFY_TOKEN),
