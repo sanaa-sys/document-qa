@@ -18,17 +18,21 @@ services:
         value: "false"
       - key: LOAD_EMBEDDING_ON_STARTUP
         value: "false"
-      - key: LOAD_FAISS_ON_STARTUP
-        value: "false"
       - key: MATCH_THRESHOLD
         value: "0.05"
       - key: INGEST_ON_STARTUP
         value: "false"
       - key: GROQ_API_KEY
         sync: false
-      - key: SUPABASE_URL
+      - key: PINECONE_API_KEY
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: PINECONE_INDEX
+        value: document-qa
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_REGION
+        value: us-east-1
+      - key: PINECONE_HOST
         sync: false
       - key: WHATSAPP_VERIFY_TOKEN
         sync: false
