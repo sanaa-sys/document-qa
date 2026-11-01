@@ -5,7 +5,7 @@ fastembed>=0.4.0
 groq>=0.13.0
 # Pin a pydantic that ships binary wheels for Python 3.11 (avoids maturin/Rust build on Render)
 pydantic==2.10.6
-pinecone>=5.4.0
+pinecone>=10.0.0
 pypdf>=5.0.0
 fonttools>=4.50.0
 python-dotenv>=1.0.0

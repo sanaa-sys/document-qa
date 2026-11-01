@@ -33,6 +33,7 @@ from pinecone_store import (
     search_chunks,
     store_uri,
     update_document,
+    uses_integrated_embed,
 )
 
 try:
@@ -129,20 +130,21 @@ def file_checksum(path: str) -> str:
 
 
 def retrieve_chunks(question: str, top_k: int = MATCH_COUNT) -> list:
-    try:
-        question_vec = embed_texts([question], input_type="query")[0]
-    except Exception as e:
-        print(f"⚠️ Embedding failed: {e}")
-        return []
+    question_vec = []
+    if not uses_integrated_embed():
+        try:
+            question_vec = embed_texts([question], input_type="query")[0]
+        except Exception as e:
+            print(f"⚠️ Embedding failed: {e}")
 
     for threshold in (MATCH_THRESHOLD, 0.0):
         try:
-            hits = search_chunks(question_vec, top_k, threshold)
+            hits = search_chunks(question_vec, top_k, threshold, query_text=question)
         except Exception as e:
-            print(f"⚠️ Vector search failed (threshold={threshold}): {e}")
+            print(f"⚠️ Documents search failed (threshold={threshold}): {e}")
             hits = []
         if hits:
-            print(f"✅ Vector hits: {len(hits)} (threshold={threshold}, best={hits[0]['score']:.3f})")
+            print(f"✅ Document hits: {len(hits)} (threshold={threshold}, best={hits[0]['score']:.3f})")
             return hits
 
     try:
@@ -326,7 +328,10 @@ def ingest_one_pdf(path: str, force: bool = False) -> dict:
                 "chunks_upserted": 0,
             }
 
-        embeddings = embed_texts([row["text"] for row in rows])
+        if uses_integrated_embed():
+            embeddings = [[] for _ in rows]
+        else:
+            embeddings = embed_texts([row["text"] for row in rows])
         chunk_rows = []
         for row, vector in zip(rows, embeddings):
             chunk_rows.append({
