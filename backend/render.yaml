@@ -16,6 +16,9 @@ services:
         value: "1"
       - key: TOKENIZERS_PARALLELISM
         value: "false"
+      # glibc malloc arenas inflate RSS. Cap them on the 512MB starter plan.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: LOAD_EMBEDDING_ON_STARTUP
         value: "false"
       - key: MATCH_THRESHOLD

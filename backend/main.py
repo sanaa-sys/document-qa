@@ -72,6 +72,19 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME") or embed_model_name()
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 200
 INGEST_BATCH_SIZE = 50
+# Render starter has 512MB. Keep each PDF parse to a few pages so pypdf's
+# object cache cannot grow for the whole book.
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, value)
+
+
+INGEST_PAGE_WINDOW = _env_int("INGEST_PAGE_WINDOW", 8)
+_INGEST_LOCK = threading.Lock()
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.05"))
 MATCH_COUNT = int(os.getenv("MATCH_COUNT", "5"))
 
@@ -248,31 +261,90 @@ def chunk_text(text: str, max_chars: int = CHUNK_CHARS, overlap: int = CHUNK_OVE
     return chunks
 
 
-def extract_pdf_chunks(path: str) -> tuple:
-    """Return (page_count, rows without document_id/embeddings)."""
+def _release_memory() -> None:
+    """Return freed heap to the OS. Linux glibc otherwise keeps the high-water mark."""
+    import gc
+
+    gc.collect()
+    if os.name != "posix":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _open_pdf(path: str):
+    """Open a PDF without copying the file into a BytesIO.
+
+    Passing a path makes pypdf read the whole file into memory. A binary
+    file object is seeked instead, which matters on a 512MB instance.
+    """
     import logging
     from pypdf import PdfReader
 
     logging.getLogger("pypdf").setLevel(logging.ERROR)
+    handle = open(path, "rb")
+    try:
+        return handle, PdfReader(handle)
+    except Exception:
+        handle.close()
+        raise
 
-    reader = PdfReader(path)
-    rows = []
-    for page_number, page in enumerate(reader.pages, start=1):
+
+def _close_pdf(handle) -> None:
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+def extract_pdf_windows(path: str):
+    """Yield (page_count, chunk rows) for a few pages at a time.
+
+    The reader is closed after each window so parsed pages, fonts, and
+    content streams do not stay resident for the rest of the book.
+    """
+    handle, reader = _open_pdf(path)
+    try:
+        page_count = len(reader.pages)
+    finally:
+        _close_pdf(handle)
+        reader = None
+        handle = None
+    _release_memory()
+
+    if page_count <= 0:
+        yield 0, []
+        return
+
+    chunk_index = 0
+    for start in range(0, page_count, INGEST_PAGE_WINDOW):
+        end = min(page_count, start + INGEST_PAGE_WINDOW)
+        handle, reader = _open_pdf(path)
+        rows = []
         try:
-            page_text = page.extract_text() or ""
-        except Exception:
-            page_text = ""
-        for text in chunk_text(page_text):
-            rows.append({
-                "page": page_number,
-                "text": text,
-                "metadata": {"page": page_number},
-            })
-
-    # Re-number chunk_index across the whole document
-    for i, row in enumerate(rows):
-        row["chunk_index"] = i
-    return len(reader.pages), rows
+            for page_number in range(start + 1, end + 1):
+                page = reader.pages[page_number - 1]
+                try:
+                    page_text = page.extract_text() or ""
+                except Exception:
+                    page_text = ""
+                del page
+                for text in chunk_text(page_text):
+                    rows.append({
+                        "page": page_number,
+                        "text": text,
+                        "chunk_index": chunk_index,
+                    })
+                    chunk_index += 1
+        finally:
+            _close_pdf(handle)
+            reader = None
+            handle = None
+        _release_memory()
+        yield page_count, rows
 
 
 def ingest_one_pdf(path: str, force: bool = False) -> dict:
@@ -300,7 +372,6 @@ def ingest_one_pdf(path: str, force: bool = False) -> dict:
             "embedding_model": EMBEDDING_MODEL_NAME,
             "error": None,
         })
-        delete_chunks(document_id)
     else:
         document_id = insert_document({
             "title": title,
@@ -312,8 +383,35 @@ def ingest_one_pdf(path: str, force: bool = False) -> dict:
         })
 
     try:
-        page_count, rows = extract_pdf_chunks(path)
-        if not rows:
+        # Drop any previous chunks once, then append window by window.
+        delete_chunks(document_id)
+        integrated = uses_integrated_embed()
+        page_count = 0
+        chunk_count = 0
+
+        for page_count, rows in extract_pdf_windows(path):
+            if not rows:
+                continue
+            if not integrated:
+                for row, vector in zip(rows, embed_texts([row["text"] for row in rows])):
+                    row["vector"] = vector
+            for row in rows:
+                row["embedding_model"] = EMBEDDING_MODEL_NAME
+            replace_chunks(
+                document_id,
+                filename,
+                title,
+                rows,
+                batch_size=INGEST_BATCH_SIZE,
+                replace=False,
+            )
+            chunk_count += len(rows)
+            last_page = rows[-1]["page"]
+            del rows
+            _release_memory()
+            print(f"… {filename}: {chunk_count} chunks through page {last_page}/{page_count}")
+
+        if chunk_count == 0:
             update_document(document_id, {
                 "status": "failed",
                 "error": "No extractable text",
@@ -328,53 +426,46 @@ def ingest_one_pdf(path: str, force: bool = False) -> dict:
                 "chunks_upserted": 0,
             }
 
-        if uses_integrated_embed():
-            embeddings = [[] for _ in rows]
-        else:
-            embeddings = embed_texts([row["text"] for row in rows])
-        chunk_rows = []
-        for row, vector in zip(rows, embeddings):
-            chunk_rows.append({
-                "chunk_index": row["chunk_index"],
-                "page": row["page"],
-                "text": row["text"],
-                "vector": vector,
-                "embedding_model": EMBEDDING_MODEL_NAME,
-            })
-
-        replace_chunks(
-            document_id,
-            filename,
-            title,
-            chunk_rows,
-            batch_size=INGEST_BATCH_SIZE,
-        )
         update_document(document_id, {
             "status": "ready",
             "page_count": page_count,
-            "chunk_count": len(chunk_rows),
+            "chunk_count": chunk_count,
             "embedding_model": EMBEDDING_MODEL_NAME,
             "error": None,
         })
 
-        print(f"✅ Ingested {filename}: {len(chunk_rows)} chunks ({page_count} pages)")
+        print(f"✅ Ingested {filename}: {chunk_count} chunks ({page_count} pages)")
         return {
             "filename": filename,
             "status": "ingested",
             "document_id": document_id,
-            "chunks_upserted": len(chunk_rows),
+            "chunks_upserted": chunk_count,
             "page_count": page_count,
         }
     except Exception as e:
+        try:
+            delete_chunks(document_id)
+        except Exception:
+            pass
         update_document(document_id, {
             "status": "failed",
             "error": str(e)[:500],
         })
+        _release_memory()
         raise
 
 
 def ingest_data_files(force: bool = False) -> dict:
-    """Parse PDFs in ./data into the Pinecone documents and chunks namespaces."""
+    """Parse PDFs in ./data into the Pinecone documents and chunks namespaces.
+
+    One ingest at a time: overlapping runs would parse two PDFs in the same
+    512MB process.
+    """
+    with _INGEST_LOCK:
+        return _ingest_data_files(force)
+
+
+def _ingest_data_files(force: bool = False) -> dict:
     pdfs = list_pdf_files()
     empty = {
         "ingested_files": [],
@@ -431,6 +522,8 @@ def ingest_data_files(force: bool = False) -> dict:
             failed.append(os.path.basename(path))
             errors[os.path.basename(path)] = str(e)
             print(f"⚠️ Ingest failed for {path}: {e}")
+        finally:
+            _release_memory()
 
     return {
         "ingested_files": ingested,
@@ -882,8 +975,9 @@ async def documents_delete(document_id: str):
 
 @app.post("/ingest")
 async def ingest(force: bool = False):
+    # Off the event loop so /health keeps responding while a PDF is parsed.
     try:
-        return ingest_data_files(force=force)
+        return await asyncio.to_thread(ingest_data_files, force)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

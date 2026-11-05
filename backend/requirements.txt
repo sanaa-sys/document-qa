@@ -1,7 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
-# Lightweight ONNX embeddings (avoids torch OOM on Render 512MB)
-fastembed>=0.4.0
+# Embeddings are computed by Pinecone. Do not add torch, sentence-transformers,
+# or fastembed — they exhaust a 512MB Render instance.
 groq>=0.13.0
 # Pin a pydantic that ships binary wheels for Python 3.11 (avoids maturin/Rust build on Render)
 pydantic==2.10.6

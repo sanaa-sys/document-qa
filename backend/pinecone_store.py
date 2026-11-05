@@ -472,6 +472,7 @@ def replace_chunks(
     title: str,
     rows: list,
     batch_size: int = 50,
+    replace: bool = True,
 ) -> None:
     schema = _schema()
     payload = []
@@ -499,10 +500,11 @@ def replace_chunks(
             doc[schema.dense_field] = [float(x) for x in vector]
         payload.append(doc)
 
-    try:
-        _docs().delete(namespace=CHUNKS_NS, filter={"document_id": {"$eq": document_id}})
-    except Exception as e:
-        print(f"⚠️ Pinecone chunk delete before replace: {e}")
+    if replace:
+        try:
+            _docs().delete(namespace=CHUNKS_NS, filter={"document_id": {"$eq": document_id}})
+        except Exception as e:
+            print(f"⚠️ Pinecone chunk delete before replace: {e}")
 
     if not payload:
         return
