@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Ban, BookText, Leaf, Pill } from 'lucide-react'
+import { Ban, BookText, Leaf, Pill, Stethoscope } from 'lucide-react'
 import {
   parseAnswerSections,
   sectionKind,
@@ -25,6 +25,11 @@ const KIND_STYLE: Record<
     wrap: 'border-rose-200/80 bg-rose-50/70 dark:border-rose-800/70 dark:bg-rose-950/40',
     iconWrap: 'bg-rose-100 text-rose-800 dark:bg-rose-900/80 dark:text-rose-100',
     icon: Ban,
+  },
+  doctor: {
+    wrap: 'border-amber-200/80 bg-amber-50/70 dark:border-amber-800/70 dark:bg-amber-950/40',
+    iconWrap: 'bg-amber-100 text-amber-900 dark:bg-amber-900/80 dark:text-amber-100',
+    icon: Stethoscope,
   },
   other: {
     wrap: 'border-border/70 bg-background/70',

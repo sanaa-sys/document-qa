@@ -8,7 +8,7 @@ export type ParsedAnswer = {
   sections: AnswerSection[]
 }
 
-export type SectionKind = 'remedies' | 'otc' | 'avoid' | 'other'
+export type SectionKind = 'remedies' | 'otc' | 'avoid' | 'doctor' | 'other'
 
 export function parseAnswerSections(text: string): ParsedAnswer {
   const lines = (text || '').replace(/\r\n/g, '\n').split('\n')
@@ -41,6 +41,8 @@ export function sectionKind(title: string): SectionKind {
   const t = title.toLowerCase()
   if (
     t.includes('home remed') ||
+    t.includes('self-care') ||
+    t.includes('self care') ||
     t.includes('natural remed') ||
     t.includes('effective home')
   ) {
@@ -56,6 +58,15 @@ export function sectionKind(title: string): SectionKind {
   }
   if (t.includes('not to do') || t.includes('avoid') || t.includes('do not')) {
     return 'avoid'
+  }
+  if (
+    t.includes('see a doctor') ||
+    t.includes('see the doctor') ||
+    t.includes('when to see') ||
+    t.includes('medical care') ||
+    t.includes('seek care')
+  ) {
+    return 'doctor'
   }
   return 'other'
 }
